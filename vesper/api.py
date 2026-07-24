@@ -19,6 +19,7 @@ from .context import ContextPack
 from .model_runtime import ModelRegistry, CognitiveRequest
 from .syscalls import SyscallEngine, SyscallRequest, SyscallError, ApprovalDecision, EffectStatus
 from .core_apps import CoreApps, CoreAppError
+from .connections import ConnectionStore, ConnectionError
 
 
 class Runtime:
@@ -31,6 +32,7 @@ class Runtime:
         self.models = ModelRegistry(self.storage)
         self.syscalls = SyscallEngine(self.storage, self.kernel)
         self.core_apps = CoreApps(self.storage)
+        self.connections = ConnectionStore(self.storage)
         self.bootstrap_token = secrets.token_urlsafe(32)
 
     def start(self) -> None:
@@ -262,6 +264,58 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             return {"anchor": instance.core_apps.create_anchor(str(body["resource_type"]), str(body["resource_id"]), client_request_id)}
         except CoreAppError as exc:
             raise core_error(exc) from exc
+
+    def connection_error(exc: ConnectionError) -> HTTPException:
+        code = getattr(exc, "code", "CONNECTION_ERROR")
+        status = 404 if code in {"CAPABILITY_NOT_FOUND", "EVIDENCE_NOT_FOUND"} else 422
+        return HTTPException(status_code=status, detail={"code": code, "message": str(exc)})
+
+    @app.post("/api/capabilities")
+    async def register_capability(request: Request):
+        body = await request.json()
+        try:
+            return {"capability": instance.connections.register_capability(server_id=str(body["server_id"]), name=str(body["name"]), description=str(body.get("description", "")), schema=dict(body.get("schema", {})), risk_class=str(body.get("risk_class", "UNTRUSTED")))}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.get("/api/capabilities/search")
+    def search_capabilities(q: str = "", limit: int = 20):
+        return {"capabilities": instance.connections.search_capabilities(q, limit=limit), "stats": instance.connections.list_capability_stats()}
+
+    @app.post("/api/capabilities/page")
+    async def page_capabilities(request: Request):
+        body = await request.json()
+        try:
+            return {"capabilities": instance.connections.page_capabilities(list(body.get("capability_ids", [])))}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.post("/api/connections/secrets/metadata")
+    async def register_secret_metadata(request: Request):
+        body = await request.json()
+        try:
+            return {"secret": instance.connections.register_secret_metadata(provider=str(body["provider"]), label=str(body.get("label", "")), secret_ref=str(body["secret_ref"]))}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.get("/api/connections/secrets/metadata")
+    def list_secret_metadata():
+        return {"secrets": instance.connections.list_secret_metadata()}
+
+    @app.post("/api/web/evidence")
+    async def fetch_web_evidence(request: Request):
+        body = await request.json()
+        try:
+            return {"evidence": instance.connections.fetch_evidence(str(body["url"]), query=body.get("query"), max_bytes=int(body.get("max_bytes", 1_000_000)))}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.get("/api/web/evidence/{evidence_id}")
+    def get_web_evidence(evidence_id: str):
+        evidence = instance.connections.get_evidence(evidence_id)
+        if evidence is None:
+            raise HTTPException(status_code=404, detail={"code": "EVIDENCE_NOT_FOUND", "message": "evidence not found"})
+        return {"evidence": evidence}
 
     @app.get("/api/director")
     def director():
