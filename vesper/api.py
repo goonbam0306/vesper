@@ -16,10 +16,11 @@ from .storage import Storage
 from .kernel import Kernel, KernelError, ProcessStatus
 from .memory import MemoryStore
 from .context import ContextPack
-from .model_runtime import ModelRegistry, CognitiveRequest
+from .model_runtime import CognitiveRuntime, ModelRegistry, CognitiveRequest, ProviderAdapters
 from .syscalls import SyscallEngine, SyscallRequest, SyscallError, ApprovalDecision, EffectStatus
 from .core_apps import CoreApps, CoreAppError
 from .connections import ConnectionStore, ConnectionError
+from .artifacts import ArtifactStore
 
 
 class Runtime:
@@ -30,9 +31,11 @@ class Runtime:
         self.kernel = Kernel(self.storage)
         self.memory = MemoryStore(self.storage)
         self.models = ModelRegistry(self.storage)
+        self.providers = ProviderAdapters()
+        self.cognitive = CognitiveRuntime(self.storage, self.kernel, self.memory, self.models, self.providers)
         self.syscalls = SyscallEngine(self.storage, self.kernel)
         self.core_apps = CoreApps(self.storage)
-        self.connections = ConnectionStore(self.storage)
+        self.connections = ConnectionStore(self.storage, artifact_store=ArtifactStore(self.home, self.storage))
         self.bootstrap_token = secrets.token_urlsafe(32)
 
     def start(self) -> None:
@@ -57,12 +60,18 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     app = FastAPI(title="Vesper", version="0.1.0", lifespan=lifespan)
     app.state.runtime = instance
+
+    @app.exception_handler(HTTPException)
+    async def typed_http_exception(_: Request, exc: HTTPException):
+        if isinstance(exc.detail, dict) and "error" in exc.detail:
+            return JSONResponse(status_code=exc.status_code, content=exc.detail)
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1", "http://localhost"],
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-Vesper-Bootstrap"],
+        allow_methods=["GET", "POST", "PATCH"],
+        allow_headers=["Content-Type", "X-Vesper-Bootstrap", "X-Client-Request-ID"],
     )
 
     @app.middleware("http")
@@ -85,14 +94,42 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     def bootstrap() -> dict[str, str]:
         return {"session": instance.bootstrap_token}
 
+    def kernel_error(exc: KernelError) -> HTTPException:
+        code = getattr(exc, "code", "KERNEL_ERROR")
+        status = 410 if code == "CURSOR_EXPIRED" else 404 if code == "PROCESS_NOT_FOUND" else 409
+        return HTTPException(status_code=status, detail={"error": {"code": code, "message": str(exc), "retryable": bool(getattr(exc, "retryable", False))}})
+
     @app.post("/api/processes")
     async def create_process(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
         body = await request.json()
         try:
-            process = instance.kernel.submit(str(body.get("origin", "director")), volatile=bool(body.get("volatile", False)), client_request_id=client_request_id)
+            process = instance.kernel.submit(
+                str(body.get("origin", "director")), volatile=bool(body.get("volatile", False)),
+                client_request_id=client_request_id, authority=body.get("authority"),
+                delegable_authority=body.get("delegable_authority"), priority=body.get("priority", "NORMAL"),
+            )
         except KernelError as exc:
-            raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "KERNEL_ERROR"), "message": str(exc)}) from exc
-        return {"process": process.__dict__}
+            raise kernel_error(exc) from exc
+        return {"ok": True, "result": {"process_id": process.process_id, "process": process.__dict__}, "process": process.__dict__}
+
+    @app.get("/api/processes")
+    def list_processes():
+        snapshot = instance.kernel.snapshot()
+        processes = snapshot.get("processes", [])
+        effects = snapshot.get("effects", [])
+        effect_by_process = {str(effect.get("process_id")): effect for effect in effects}
+        projection = []
+        for process in processes:
+            item = dict(process)
+            effect = effect_by_process.get(str(item.get("process_id")))
+            item["waiting_reason"] = "approval_required" if item.get("status") == "WAITING" else None
+            item["parent_id"] = item.get("parent_process_id")
+            item["children"] = [child.get("process_id") for child in processes if child.get("parent_process_id") == item.get("process_id")]
+            item["dependency_state"] = "none"
+            item["result_summary"] = (effect or {}).get("status")
+            item["effect_summary"] = (effect or {}).get("output", {})
+            projection.append(item)
+        return {"processes": projection}
 
     @app.get("/api/processes/{process_id}")
     def get_process(process_id: str):
@@ -107,16 +144,25 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         try:
             process = instance.kernel.transition(process_id, ProcessStatus(str(body["status"])), expected_revision=body.get("expected_revision"))
         except KernelError as exc:
-            raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "KERNEL_ERROR"), "message": str(exc)}) from exc
-        return {"process": process.__dict__}
+            raise kernel_error(exc) from exc
+        return {"ok": True, "result": {"process": process.__dict__}}
 
     @app.get("/api/watch")
     def watch(cursor: int = 0):
-        return {"events": instance.kernel.events_after(cursor), "cursor": instance.kernel.snapshot()["cursor"]}
+        try:
+            return {"ok": True, **instance.kernel.events_after(cursor)}
+        except KernelError as exc:
+            raise kernel_error(exc) from exc
 
     @app.get("/api/snapshot")
     def snapshot():
         return instance.kernel.snapshot()
+
+    @app.get("/api/effects")
+    def list_effects():
+        def read(conn):
+            return [dict(row) for row in conn.execute("SELECT * FROM effects ORDER BY created_at, effect_id").fetchall()]
+        return {"effects": instance.storage.write(read)}
 
     @app.post("/api/memories")
     async def create_memory(request: Request):
@@ -160,6 +206,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 return {"status": "WAITING", "approval_id": approval_id}
             raise HTTPException(status_code=403, detail={"code": getattr(exc, "code", "SYSCALL_ERROR"), "message": str(exc)}) from exc
         return {"status": result.status, "output": result.output, "effect_id": result.effect_id, "approval_id": result.approval_id}
+
+    @app.get("/api/approvals")
+    def list_approvals():
+        def read(conn):
+            return [dict(row) for row in conn.execute("SELECT * FROM approvals ORDER BY created_at, approval_id").fetchall()]
+        return {"approvals": instance.storage.write(read)}
 
     @app.post("/api/approvals/{approval_id}")
     async def decide_approval(approval_id: str, request: Request):
@@ -229,6 +281,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     def list_calendar():
         return {"calendar": instance.core_apps.list_calendar()}
 
+    @app.get("/api/ideas")
+    def list_ideas():
+        return {"ideas": instance.core_apps.list_ideas()}
+
     @app.post("/api/calendar")
     async def create_calendar(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
         body = await request.json()
@@ -253,6 +309,28 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except CoreAppError as exc:
             raise core_error(exc) from exc
 
+    @app.post("/api/calendar/{calendar_id}/undo")
+    async def undo_calendar(calendar_id: str, request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        try:
+            return {"calendar": instance.core_apps.undo_calendar(calendar_id, client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
+    @app.get("/api/settings")
+    def settings():
+        result = instance.core_apps.settings()
+        result["model_route"] = result.get("model_route", {"status": "unconfigured"})
+        result["web_research"] = {"status": "available" if instance.connections.list_capability_stats().get("authorized", 0) else "unconfigured"}
+        return result
+
+    @app.post("/api/settings")
+    async def update_settings(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"settings": instance.core_apps.update_settings(dict(body.get("patch", body)), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
     @app.get("/api/search")
     def deterministic_search(q: str):
         return instance.core_apps.search(q)
@@ -260,8 +338,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.post("/api/anchors")
     async def create_anchor(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
         body = await request.json()
+        resource_ref = dict(body.get("resource_ref", {}))
+        if not resource_ref and body.get("resource_type") and body.get("resource_id"):
+            resource_ref = {"resource_type": str(body["resource_type"]), "resource_id": str(body["resource_id"])}
+        if not resource_ref:
+            raise HTTPException(status_code=422, detail="resource_ref is required")
         try:
-            return {"anchor": instance.core_apps.create_anchor(str(body["resource_type"]), str(body["resource_id"]), client_request_id)}
+            return {"anchor": instance.core_apps.create_anchor(str(body.get("anchor_type", "resource")), resource_ref, list(body.get("selection_refs", [])), body.get("view_scope_ref"), client_request_id)}
         except CoreAppError as exc:
             raise core_error(exc) from exc
 
@@ -277,6 +360,24 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             return {"capability": instance.connections.register_capability(server_id=str(body["server_id"]), name=str(body["name"]), description=str(body.get("description", "")), schema=dict(body.get("schema", {})), risk_class=str(body.get("risk_class", "UNTRUSTED")))}
         except ConnectionError as exc:
             raise connection_error(exc) from exc
+
+    @app.get("/api/connections")
+    def list_connections():
+        capabilities = instance.connections.search_capabilities("", limit=20)
+        return {
+            "connections": [
+                {
+                    "provider": item["server_id"],
+                    "name": item["name"],
+                    "description": item["description"],
+                    "health": "available" if item["state"] in {"EXPOSED", "AUTHORIZED"} else "unconfigured",
+                    "status": item["state"],
+                    "risk_class": item["risk_class"],
+                }
+                for item in capabilities
+            ],
+            "stats": instance.connections.list_capability_stats(),
+        }
 
     @app.get("/api/capabilities/search")
     def search_capabilities(q: str = "", limit: int = 20):

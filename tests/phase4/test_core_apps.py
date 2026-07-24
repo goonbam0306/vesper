@@ -40,8 +40,14 @@ def test_command_idempotency_and_revision_conflict(tmp_path):
 
 def test_anchor_has_no_authority(tmp_path):
     instance = runtime(tmp_path)
-    anchor = instance.core_apps.create_anchor("project", "not-authorized")
+    anchor = instance.core_apps.create_anchor(
+        "resource",
+        {"resource_type": "project", "resource_id": "not-authorized"},
+        [{"resource_type": "task", "resource_id": "selected-only"}],
+        "projects",
+    )
     assert anchor["authority"] == []
+    assert anchor["resource_ref"]["resource_id"] == "not-authorized"
     instance.stop()
 
 

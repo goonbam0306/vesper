@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
+
 from fastapi.testclient import TestClient
 
 from vesper.api import Runtime, create_app
@@ -45,6 +46,35 @@ def test_capability_paging_does_not_expand_with_catalog(tmp_path):
         oversized = api.post("/api/capabilities/page", json={"capability_ids": ids[:21]})
         assert oversized.status_code == 422
         assert oversized.json()["detail"]["code"] == "CAPABILITY_PAGE_TOO_LARGE"
+
+
+def test_capability_search_is_deterministic_and_runtime_scoped(tmp_path):
+    first_home = tmp_path / "first"
+    second_home = tmp_path / "second"
+    with client(first_home) as first, client(second_home) as second:
+        for index in range(100):
+            response = first.post(
+                "/api/capabilities",
+                json={
+                    "server_id": f"server-{index % 3}",
+                    "name": f"Tool {index:03d}",
+                    "description": "deterministic discovery candidate",
+                    "schema": {"type": "object", "properties": {"index": {"const": index}}},
+                },
+            )
+            assert response.status_code == 200
+
+        first_result = first.get("/api/capabilities/search", params={"q": "  tool  ", "limit": 100}).json()
+        repeated = [first.get("/api/capabilities/search", params={"q": "TOOL", "limit": 100}).json() for _ in range(10)]
+        assert first_result["stats"]["registered"] == 100
+        assert len(first_result["capabilities"]) == 20
+        assert all(item["state"] == "REGISTERED" for item in first_result["capabilities"])
+        assert all(result["capabilities"] == first_result["capabilities"] for result in repeated)
+        assert [item["name"] for item in first_result["capabilities"]] == [f"Tool {index:03d}" for index in range(20)]
+        assert second.get("/api/capabilities/search", params={"q": "tool"}).json() == {
+            "capabilities": [],
+            "stats": {"registered": 0, "eligible": 0, "exposed": 0, "authorized": 0},
+        }
 
 
 def test_secret_metadata_never_accepts_raw_secret_field(tmp_path):

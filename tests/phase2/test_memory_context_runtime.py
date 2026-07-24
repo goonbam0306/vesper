@@ -33,7 +33,7 @@ def test_context_pack_is_deterministic_and_fault_is_new_pack():
     second = ContextPack.build({"K3": frames["K3"], "K0": frames["K0"]})
     assert first.pack_id == second.pack_id
     faulted = first.page_fault("missing evidence")
-    assert faulted.pack_id == first.pack_id
+    assert faulted.pack_id != first.pack_id
     assert faulted.fault == "missing evidence"
     assert admit(authorized=True, relevant=True, current=True, needed=True, worth_cost=True)
     assert not admit(authorized=False, relevant=True, current=True, needed=True, worth_cost=True)

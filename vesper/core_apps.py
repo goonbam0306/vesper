@@ -145,7 +145,7 @@ class CoreApps:
             return self._resource(c, "calendar_items", "calendar_id", calendar_id, "calendar")
         return self._command(request_id, intent, create)
 
-    def update_calendar(self, calendar_id: str, patch: dict[str, Any], expected_revision: int | None = None, request_id: str | None = None) -> dict[str, Any]:
+    def update_calendar(self, calendar_id: str, patch: dict[str, Any], expected_revision: int | None = None, request_id: str | None = None, *, record_undo: bool = True) -> dict[str, Any]:
         allowed = {key: patch[key] for key in ("title", "starts_at", "ends_at", "project_id") if key in patch}
         intent = {"op": "calendar.update", "calendar_id": calendar_id, "patch": allowed, "expected_revision": expected_revision}
         def update(c):
@@ -159,10 +159,72 @@ class CoreApps:
             if ends <= starts:
                 raise CoreAppError("calendar end must be after start")
             if allowed:
+                inverse = {key: row[key] for key in allowed}
                 sets = ",".join(f"{key}=?" for key in allowed)
                 c.execute(f"UPDATE calendar_items SET {sets}, revision=revision+1, updated_at=? WHERE calendar_id=?", (*allowed.values(), self._now(), calendar_id))
+                updated = self._resource(c, "calendar_items", "calendar_id", calendar_id, "calendar")
+                if record_undo:
+                    c.execute(
+                        "INSERT INTO committed_undo(undo_id,resource_type,resource_id,inverse_patch_json,source_revision) VALUES(?,?,?,?,?)",
+                        (str(uuid.uuid4()), "calendar", calendar_id, json.dumps(inverse, sort_keys=True), updated["revision"]),
+                    )
+                return updated
             return self._resource(c, "calendar_items", "calendar_id", calendar_id, "calendar")
         return self._command(request_id, intent, update)
+
+    def undo_calendar(self, calendar_id: str, request_id: str | None = None) -> dict[str, Any]:
+        intent = {"op": "calendar.undo", "calendar_id": calendar_id}
+        def undo(c):
+            row = c.execute(
+                "SELECT * FROM committed_undo WHERE resource_type='calendar' AND resource_id=? AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1",
+                (calendar_id,),
+            ).fetchone()
+            if not row:
+                raise NotFound(f"undo:{calendar_id}")
+            current = c.execute("SELECT revision FROM calendar_items WHERE calendar_id=?", (calendar_id,)).fetchone()
+            if not current:
+                raise NotFound(calendar_id)
+            if current["revision"] != row["source_revision"]:
+                raise RevisionConflict(calendar_id)
+            inverse = json.loads(row["inverse_patch_json"])
+            sets = ",".join(f"{key}=?" for key in inverse)
+            c.execute(f"UPDATE calendar_items SET {sets}, revision=revision+1, updated_at=? WHERE calendar_id=?", (*inverse.values(), self._now(), calendar_id))
+            c.execute("UPDATE committed_undo SET consumed_at=? WHERE undo_id=?", (self._now(), row["undo_id"]))
+            return self._resource(c, "calendar_items", "calendar_id", calendar_id, "calendar")
+        return self._command(request_id, intent, undo)
+
+    def list_ideas(self) -> list[dict[str, Any]]:
+        def read(c):
+            rows = c.execute("SELECT memory_id,kind,payload_json,revision,created_at,updated_at FROM memories WHERE kind='IDEA' ORDER BY created_at DESC").fetchall()
+            return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
+        return self.storage.write(read)
+
+    def settings(self) -> dict[str, Any]:
+        def read(c):
+            values = {row["setting_key"]: json.loads(row["value_json"]) for row in c.execute("SELECT setting_key,value_json FROM app_settings")}
+            director = c.execute("SELECT preferred_name FROM director_profile WHERE id=1").fetchone()
+            return {"director_display_name": director["preferred_name"] if director else None, **values}
+        return self.storage.write(read)
+
+    def update_settings(self, patch: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
+        allowed = {key: patch[key] for key in ("director_display_name", "developer_diagnostics") if key in patch}
+        intent = {"op": "settings.update", "patch": allowed}
+        def update(c):
+            if "director_display_name" in allowed:
+                c.execute(
+                    "INSERT INTO director_profile(id, preferred_name) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET preferred_name=excluded.preferred_name, updated_at=CURRENT_TIMESTAMP",
+                    (allowed["director_display_name"],),
+                )
+            if "developer_diagnostics" in allowed:
+                c.execute(
+                    "INSERT INTO app_settings(setting_key,value_json,revision,updated_at) VALUES('developer_diagnostics',?,1,?) ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,revision=app_settings.revision+1,updated_at=excluded.updated_at",
+                    (json.dumps(bool(allowed["developer_diagnostics"])), self._now()),
+                )
+            values = {row["setting_key"]: json.loads(row["value_json"]) for row in c.execute("SELECT setting_key,value_json FROM app_settings")}
+            director = c.execute("SELECT preferred_name FROM director_profile WHERE id=1").fetchone()
+            return {"director_display_name": director["preferred_name"] if director else None, **values}
+        return self._command(request_id, intent, update)
+
 
     def list_calendar(self) -> list[dict[str, Any]]:
         return self.storage.write(lambda c: [self._resource(c, "calendar_items", "calendar_id", row["calendar_id"], "calendar") for row in c.execute("SELECT calendar_id FROM calendar_items ORDER BY starts_at")])
@@ -178,12 +240,15 @@ class CoreApps:
             return data | {"revision": 1, "created_at": now, "updated_at": now}
         return self._command(request_id, intent, capture)
 
-    def create_anchor(self, resource_type: str, resource_id: str, request_id: str | None = None) -> dict[str, Any]:
+    def create_anchor(self, anchor_type: str, resource_ref: dict[str, Any], selection_refs: list[dict[str, Any]] | None = None, view_scope_ref: str | None = None, request_id: str | None = None) -> dict[str, Any]:
         anchor_id = str(uuid.uuid4())
-        intent = {"op": "anchor.create", "resource_type": resource_type, "resource_id": resource_id}
+        selection_refs = selection_refs or []
+        intent = {"op": "anchor.create", "anchor_type": anchor_type, "resource_ref": resource_ref, "selection_refs": selection_refs, "view_scope_ref": view_scope_ref}
         def create(c):
+            resource_type = str(resource_ref.get("resource_type", "reference"))
+            resource_id = str(resource_ref.get("resource_id", ""))
             c.execute("INSERT INTO interaction_anchors(anchor_id,resource_type,resource_id) VALUES(?,?,?)", (anchor_id, resource_type, resource_id))
-            return {"anchor_id": anchor_id, "resource_type": resource_type, "resource_id": resource_id, "authority": []}
+            return {"anchor_id": anchor_id, "anchor_type": anchor_type, "resource_ref": resource_ref, "selection_refs": selection_refs, "view_scope_ref": view_scope_ref, "authority": []}
         return self._command(request_id, intent, create)
 
     def search(self, query: str) -> dict[str, Any]:
