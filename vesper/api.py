@@ -17,6 +17,7 @@ from .kernel import Kernel, KernelError, ProcessStatus
 from .memory import MemoryStore
 from .context import ContextPack
 from .model_runtime import ModelRegistry, CognitiveRequest
+from .syscalls import SyscallEngine, SyscallRequest, SyscallError, ApprovalDecision, EffectStatus
 
 
 class Runtime:
@@ -27,6 +28,7 @@ class Runtime:
         self.kernel = Kernel(self.storage)
         self.memory = MemoryStore(self.storage)
         self.models = ModelRegistry(self.storage)
+        self.syscalls = SyscallEngine(self.storage, self.kernel)
         self.bootstrap_token = secrets.token_urlsafe(32)
 
     def start(self) -> None:
@@ -141,6 +143,38 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         body = await request.json()
         route = instance.models.route(CognitiveRequest(capabilities=frozenset(body.get("capabilities", ["text"])), privacy=str(body.get("privacy", "local_preferred")), reliability_floor=float(body.get("reliability_floor", 0.0)), max_cost=body.get("max_cost"), max_latency_ms=body.get("max_latency_ms")))
         return {"route_id": route.route_id, "model_id": route.model_id, "provider": route.provider}
+
+    @app.post("/api/processes/{process_id}/syscalls")
+    async def execute_syscall(process_id: str, request: Request):
+        body = await request.json()
+        syscall = SyscallRequest(process_id=process_id, operation=str(body["operation"]), target=str(body.get("target", "*")), args=dict(body.get("args", {})), precondition=dict(body.get("precondition", {})), actor="model")
+        try:
+            result = instance.syscalls.execute(syscall, approval_id=body.get("approval_id"))
+        except SyscallError as exc:
+            if getattr(exc, "code", "") == "APPROVAL_REQUIRED":
+                approval_id = instance.syscalls.request_approval(syscall)
+                return {"status": "WAITING", "approval_id": approval_id}
+            raise HTTPException(status_code=403, detail={"code": getattr(exc, "code", "SYSCALL_ERROR"), "message": str(exc)}) from exc
+        return {"status": result.status, "output": result.output, "effect_id": result.effect_id, "approval_id": result.approval_id}
+
+    @app.post("/api/approvals/{approval_id}")
+    async def decide_approval(approval_id: str, request: Request):
+        body = await request.json()
+        try:
+            decision = ApprovalDecision(str(body["decision"]))
+            approval = instance.syscalls.decide(approval_id, decision)
+        except SyscallError as exc:
+            raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "SYSCALL_ERROR"), "message": str(exc)}) from exc
+        return {"approval_id": approval, "decision": decision}
+
+    @app.post("/api/effects/{effect_id}/reconcile")
+    async def reconcile_effect(effect_id: str, request: Request):
+        body = await request.json()
+        try:
+            instance.syscalls.reconcile(effect_id, status=EffectStatus(str(body["status"])), output=dict(body.get("output", {})))
+        except SyscallError as exc:
+            raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "SYSCALL_ERROR"), "message": str(exc)}) from exc
+        return {"effect_id": effect_id, "status": body["status"]}
 
     @app.get("/api/director")
     def director():

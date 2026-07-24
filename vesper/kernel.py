@@ -24,7 +24,7 @@ class ProcessStatus(StrEnum):
 
 TERMINAL = {ProcessStatus.COMPLETED, ProcessStatus.FAILED, ProcessStatus.CANCELLED}
 ALLOWED = {
-    ProcessStatus.CREATED: {ProcessStatus.RUNNING, ProcessStatus.CANCELLED},
+    ProcessStatus.CREATED: {ProcessStatus.RUNNING, ProcessStatus.WAITING, ProcessStatus.CANCELLED},
     ProcessStatus.RUNNING: {ProcessStatus.WAITING, ProcessStatus.PAUSED, *TERMINAL},
     ProcessStatus.WAITING: {ProcessStatus.RUNNING, ProcessStatus.PAUSED, *TERMINAL},
     ProcessStatus.PAUSED: {ProcessStatus.RUNNING, *TERMINAL},
