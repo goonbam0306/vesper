@@ -18,6 +18,7 @@ from .memory import MemoryStore
 from .context import ContextPack
 from .model_runtime import ModelRegistry, CognitiveRequest
 from .syscalls import SyscallEngine, SyscallRequest, SyscallError, ApprovalDecision, EffectStatus
+from .core_apps import CoreApps, CoreAppError
 
 
 class Runtime:
@@ -29,6 +30,7 @@ class Runtime:
         self.memory = MemoryStore(self.storage)
         self.models = ModelRegistry(self.storage)
         self.syscalls = SyscallEngine(self.storage, self.kernel)
+        self.core_apps = CoreApps(self.storage)
         self.bootstrap_token = secrets.token_urlsafe(32)
 
     def start(self) -> None:
@@ -175,6 +177,91 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except SyscallError as exc:
             raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "SYSCALL_ERROR"), "message": str(exc)}) from exc
         return {"effect_id": effect_id, "status": body["status"]}
+
+    def core_error(exc: CoreAppError) -> HTTPException:
+        code = getattr(exc, "code", "CORE_APP_ERROR")
+        status = 409 if code in {"REVISION_CONFLICT", "IDEMPOTENCY_CONFLICT"} else 404 if code == "NOT_FOUND" else 422
+        return HTTPException(status_code=status, detail={"code": code, "message": str(exc), "retryable": code == "REVISION_CONFLICT"})
+
+    @app.get("/api/projects")
+    def list_projects():
+        return {"projects": instance.core_apps.list_projects()}
+
+    @app.post("/api/projects")
+    async def create_project(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"project": instance.core_apps.create_project(str(body["name"]), str(body.get("objective", "")), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
+    @app.patch("/api/projects/{project_id}")
+    async def update_project(project_id: str, request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"project": instance.core_apps.update_project(project_id, dict(body.get("patch", body)), body.get("expected_revision"), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
+    @app.get("/api/tasks")
+    def list_tasks(status: str | None = None):
+        return {"tasks": instance.core_apps.list_tasks(status)}
+
+    @app.post("/api/tasks")
+    async def create_task(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"task": instance.core_apps.create_task(str(body["title"]), int(body.get("priority", 3)), body.get("project_id"), body.get("due_at"), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
+    @app.patch("/api/tasks/{task_id}")
+    async def update_task(task_id: str, request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"task": instance.core_apps.update_task(task_id, dict(body.get("patch", body)), body.get("expected_revision"), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
+    @app.get("/api/calendar")
+    def list_calendar():
+        return {"calendar": instance.core_apps.list_calendar()}
+
+    @app.post("/api/calendar")
+    async def create_calendar(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"calendar": instance.core_apps.create_calendar(str(body["title"]), str(body["starts_at"]), str(body["ends_at"]), body.get("project_id"), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
+    @app.patch("/api/calendar/{calendar_id}")
+    async def update_calendar(calendar_id: str, request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"calendar": instance.core_apps.update_calendar(calendar_id, dict(body.get("patch", body)), body.get("expected_revision"), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
+    @app.post("/api/ideas")
+    async def capture_idea(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"idea": instance.core_apps.capture_idea(dict(body.get("payload", body)), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
+
+    @app.get("/api/search")
+    def deterministic_search(q: str):
+        return instance.core_apps.search(q)
+
+    @app.post("/api/anchors")
+    async def create_anchor(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            return {"anchor": instance.core_apps.create_anchor(str(body["resource_type"]), str(body["resource_id"]), client_request_id)}
+        except CoreAppError as exc:
+            raise core_error(exc) from exc
 
     @app.get("/api/director")
     def director():
