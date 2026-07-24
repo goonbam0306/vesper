@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import ensure_runtime_dirs, vesper_home
 from .storage import Storage
+from .kernel import Kernel, KernelError, ProcessStatus
 
 
 class Runtime:
@@ -20,6 +21,7 @@ class Runtime:
         self.home = home or vesper_home()
         ensure_runtime_dirs(self.home)
         self.storage = Storage(self.home / "vesper.sqlite3")
+        self.kernel = Kernel(self.storage)
         self.bootstrap_token = secrets.token_urlsafe(32)
 
     def start(self) -> None:
@@ -71,6 +73,39 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.get("/api/bootstrap")
     def bootstrap() -> dict[str, str]:
         return {"session": instance.bootstrap_token}
+
+    @app.post("/api/processes")
+    async def create_process(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        try:
+            process = instance.kernel.submit(str(body.get("origin", "director")), volatile=bool(body.get("volatile", False)), client_request_id=client_request_id)
+        except KernelError as exc:
+            raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "KERNEL_ERROR"), "message": str(exc)}) from exc
+        return {"process": process.__dict__}
+
+    @app.get("/api/processes/{process_id}")
+    def get_process(process_id: str):
+        process = instance.kernel.get(process_id)
+        if process is None:
+            raise HTTPException(status_code=404, detail="process not found")
+        return {"process": process.__dict__}
+
+    @app.post("/api/processes/{process_id}/transition")
+    async def transition_process(process_id: str, request: Request):
+        body = await request.json()
+        try:
+            process = instance.kernel.transition(process_id, ProcessStatus(str(body["status"])), expected_revision=body.get("expected_revision"))
+        except KernelError as exc:
+            raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "KERNEL_ERROR"), "message": str(exc)}) from exc
+        return {"process": process.__dict__}
+
+    @app.get("/api/watch")
+    def watch(cursor: int = 0):
+        return {"events": instance.kernel.events_after(cursor), "cursor": instance.kernel.snapshot()["cursor"]}
+
+    @app.get("/api/snapshot")
+    def snapshot():
+        return instance.kernel.snapshot()
 
     @app.get("/api/director")
     def director():

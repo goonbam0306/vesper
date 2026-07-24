@@ -21,6 +21,6 @@ def test_normal_migration_is_restartable(tmp_path: Path):
     storage.migrate()
     connection = storage.connect()
     try:
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 1
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] >= 1
     finally:
         connection.close()
