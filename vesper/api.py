@@ -14,6 +14,9 @@ from fastapi.staticfiles import StaticFiles
 from .config import ensure_runtime_dirs, vesper_home
 from .storage import Storage
 from .kernel import Kernel, KernelError, ProcessStatus
+from .memory import MemoryStore
+from .context import ContextPack
+from .model_runtime import ModelRegistry, CognitiveRequest
 
 
 class Runtime:
@@ -22,6 +25,8 @@ class Runtime:
         ensure_runtime_dirs(self.home)
         self.storage = Storage(self.home / "vesper.sqlite3")
         self.kernel = Kernel(self.storage)
+        self.memory = MemoryStore(self.storage)
+        self.models = ModelRegistry(self.storage)
         self.bootstrap_token = secrets.token_urlsafe(32)
 
     def start(self) -> None:
@@ -106,6 +111,36 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.get("/api/snapshot")
     def snapshot():
         return instance.kernel.snapshot()
+
+    @app.post("/api/memories")
+    async def create_memory(request: Request):
+        body = await request.json()
+        memory = instance.memory.put(kind=str(body["kind"]), payload=dict(body["payload"]), schema_id=str(body.get("schema_id", "memory")), scope_refs=tuple(body.get("scope_refs", [])), provenance=dict(body.get("provenance", {"source": "director"})), memory_id=body.get("memory_id"))
+        return {"memory": instance.memory.to_dict(memory)}
+
+    @app.get("/api/memories/{memory_id}")
+    def get_memory(memory_id: str):
+        memory = instance.memory.get(memory_id)
+        if memory is None:
+            raise HTTPException(status_code=404, detail="memory not found")
+        return {"memory": instance.memory.to_dict(memory), "history": [instance.memory.to_dict(item) for item in instance.memory.history(memory_id)]}
+
+    @app.get("/api/memory/search")
+    def search_memory(q: str, scope: str | None = None):
+        result = instance.memory.retrieve(q, scope_refs=(scope,) if scope else ())
+        return {"status": result.status, "query": result.query, "items": [instance.memory.to_dict(item) for item in result.items]}
+
+    @app.post("/api/context-pack")
+    async def context_pack(request: Request):
+        body = await request.json()
+        pack = ContextPack.build(dict(body.get("frames", {})), fault=body.get("fault"))
+        return {"pack_id": pack.pack_id, "serialized": pack.serialize(), "wire_prefix": pack.wire_prefix()}
+
+    @app.post("/api/model/route")
+    async def model_route(request: Request):
+        body = await request.json()
+        route = instance.models.route(CognitiveRequest(capabilities=frozenset(body.get("capabilities", ["text"])), privacy=str(body.get("privacy", "local_preferred")), reliability_floor=float(body.get("reliability_floor", 0.0)), max_cost=body.get("max_cost"), max_latency_ms=body.get("max_latency_ms")))
+        return {"route_id": route.route_id, "model_id": route.model_id, "provider": route.provider}
 
     @app.get("/api/director")
     def director():
