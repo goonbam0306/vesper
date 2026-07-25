@@ -207,7 +207,7 @@ class CoreApps:
         return self.storage.write(read)
 
     def update_settings(self, patch: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
-        allowed = {key: patch[key] for key in ("director_display_name", "developer_diagnostics") if key in patch}
+        allowed = {key: patch[key] for key in ("director_display_name", "developer_diagnostics", "model_route", "first_boot_completed") if key in patch}
         intent = {"op": "settings.update", "patch": allowed}
         def update(c):
             if "director_display_name" in allowed:
@@ -220,6 +220,12 @@ class CoreApps:
                     "INSERT INTO app_settings(setting_key,value_json,revision,updated_at) VALUES('developer_diagnostics',?,1,?) ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,revision=app_settings.revision+1,updated_at=excluded.updated_at",
                     (json.dumps(bool(allowed["developer_diagnostics"])), self._now()),
                 )
+            for key in ("model_route", "first_boot_completed"):
+                if key in allowed:
+                    c.execute(
+                        "INSERT INTO app_settings(setting_key,value_json,revision,updated_at) VALUES(?,?,1,?) ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,revision=app_settings.revision+1,updated_at=excluded.updated_at",
+                        (key, json.dumps(allowed[key], sort_keys=True), self._now()),
+                    )
             values = {row["setting_key"]: json.loads(row["value_json"]) for row in c.execute("SELECT setting_key,value_json FROM app_settings")}
             director = c.execute("SELECT preferred_name FROM director_profile WHERE id=1").fetchone()
             return {"director_display_name": director["preferred_name"] if director else None, **values}

@@ -63,12 +63,23 @@ class Storage:
         self._metrics: list[dict[str, float | int | str | bool]] = []
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=0.0, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA busy_timeout = 0")
-        return connection
+        last_error: sqlite3.Error | None = None
+        for attempt in range(self.busy_retry_limit + 1):
+            connection = sqlite3.connect(self.path, timeout=0.0, check_same_thread=False)
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA busy_timeout = 0")
+                return connection
+            except sqlite3.OperationalError as exc:
+                connection.close()
+                last_error = exc
+                if "locked" not in str(exc).lower() or attempt >= self.busy_retry_limit:
+                    raise
+                time.sleep(self.busy_backoff_ms / 1000 * (attempt + 1))
+        assert last_error is not None
+        raise last_error
 
     def migration_inventory(self) -> tuple[Migration, ...]:
         """Parse and validate revision identities; ordering authority is numeric version, never filename order."""

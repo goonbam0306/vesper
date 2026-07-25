@@ -395,18 +395,38 @@ class ConnectionStore:
     def list_secret_metadata(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.storage.write(lambda c: c.execute("SELECT secret_ref,provider,label,backend,created_at FROM secret_metadata ORDER BY created_at DESC").fetchall())]
 
-    def register_provider_connection(self, *, connection_id: str, display_name: str, base_url: str, api_style: str, credential_ref: str | None = None, headers_ref: str | None = None) -> dict[str, Any]:
+    def register_provider_connection(self, *, connection_id: str, display_name: str, base_url: str, api_style: str, credential_ref: str | None = None, headers_ref: str | None = None, endpoint_type: str = "custom", provider: str = "openai-compatible") -> dict[str, Any]:
         if api_style not in {"official", "openai-compatible", "local-compatible"}:
             raise ConnectionError("INVALID_API_STYLE", api_style)
         if credential_ref:
             self._credential_ref(credential_ref)
         if headers_ref:
             self._credential_ref(headers_ref)
-        self.storage.write(lambda c: c.execute("INSERT OR REPLACE INTO provider_connections(connection_id,display_name,base_url,api_style,credential_ref,headers_ref) VALUES(?,?,?,?,?,?)", (connection_id, display_name, base_url, api_style, credential_ref, headers_ref)))
-        return {"connection_id": connection_id, "display_name": display_name, "base_url": base_url, "api_style": api_style, "credential_ref": credential_ref, "headers_ref": headers_ref}
+        self.storage.write(lambda c: c.execute("INSERT OR REPLACE INTO provider_connections(connection_id,display_name,base_url,api_style,credential_ref,headers_ref,endpoint_type,provider) VALUES(?,?,?,?,?,?,?,?)", (connection_id, display_name, base_url, api_style, credential_ref, headers_ref, endpoint_type, provider)))
+        return {"connection_id": connection_id, "display_name": display_name, "base_url": base_url, "api_style": api_style, "credential_ref": credential_ref, "headers_ref": headers_ref, "endpoint_type": endpoint_type, "provider": provider, "has_credential": bool(credential_ref)}
 
     def provider_connections(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.storage.write(lambda c: c.execute("SELECT connection_id,display_name,base_url,api_style,credential_ref,headers_ref FROM provider_connections ORDER BY connection_id").fetchall())]
+        """Return safe user-facing connection metadata only.
+
+        Credential references are operational internals and must not cross API
+        read boundaries; `has_credential` is sufficient for the UI.
+        """
+        return [
+            {
+                "connection_id": row["connection_id"],
+                "display_name": row["display_name"],
+                "base_url": row["base_url"],
+                "api_style": row["api_style"],
+                "endpoint_type": row["endpoint_type"],
+                "provider": row["provider"],
+                "has_credential": bool(row["credential_ref"]),
+            }
+            for row in self.storage.write(
+                lambda c: c.execute(
+                    "SELECT connection_id,display_name,base_url,api_style,endpoint_type,provider,credential_ref FROM provider_connections ORDER BY connection_id"
+                ).fetchall()
+            )
+        ]
 
     def operational_metrics(self) -> dict[str, float | int]:
         return dict(self.metrics)

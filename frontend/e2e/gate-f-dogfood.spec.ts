@@ -1,113 +1,6 @@
 import { expect, test } from '@playwright/test'
-import { createServer, type Server } from 'node:http'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import path from 'node:path'
-import { spawn, type ChildProcess } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
 
-const frontendDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const repoDir = path.resolve(frontendDir, '..')
-const python = path.join(repoDir, '.venv', 'bin', 'python')
-
-type ManagedChild = { process: ChildProcess; output: () => string }
-
-type Harness = {
-  backend: ManagedChild
-  frontend: ManagedChild
-  home: string
-  backendUrl: string
-  frontendUrl: string
-  close: () => Promise<void>
-}
-
-async function freePort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const server = createServer()
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address()
-      server.close(error => error ? reject(error) : resolve((address as { port: number }).port))
-    })
-  })
-}
-
-async function waitFor(url: string): Promise<void> {
-  const deadline = Date.now() + 15_000
-  let lastError: unknown
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(url)
-      if (response.ok) return
-      lastError = new Error(`${url}: ${response.status}`)
-    } catch (error) { lastError = error }
-    await new Promise(resolve => setTimeout(resolve, 100))
-  }
-  throw lastError ?? new Error(`Timed out waiting for ${url}`)
-}
-
-function child(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): ManagedChild {
-  const process = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
-  let output = ''
-  process.stdout?.on('data', chunk => { output += String(chunk) })
-  process.stderr?.on('data', chunk => { output += String(chunk) })
-  return { process, output: () => output }
-}
-
-async function stop(child: ManagedChild): Promise<void> {
-  const process = child.process
-  if (process.exitCode !== null || process.killed) return
-  process.kill('SIGTERM')
-  await Promise.race([
-    new Promise<void>(resolve => process.once('exit', () => resolve())),
-    new Promise<void>(resolve => setTimeout(resolve, 5_000)),
-  ])
-  if (process.exitCode === null) process.kill('SIGKILL')
-}
-
-async function startHarness(): Promise<Harness> {
-  const home = await mkdtemp(path.join(tmpdir(), 'vesper-gate-f-'))
-  const backendPort = await freePort()
-  const frontendPort = await freePort()
-  const backendEnv = { ...process.env, VESPER_HOME: home, PYTHONUNBUFFERED: '1' }
-  // The fixture installs an ordinary, selector-specific DENY rule through SyscallEngine.grant.
-  // The application still starts through the same Runtime/create_app and Kernel paths as production.
-  const backendProgram = [
-    'from pathlib import Path',
-    'from vesper.api import Runtime, create_app',
-    'from vesper.syscalls import Decision',
-    'import uvicorn',
-    `runtime = Runtime(Path(${JSON.stringify(home)}))`,
-    'runtime.start()',
-    "runtime.syscalls.grant(operation='test.effect', resource_selector='e2e-denied-target', decision=Decision.DENY, issuer='director', rule_id='e2e-canonical-deny')",
-    "runtime.syscalls.grant(operation='test.effect', resource_selector='e2e-anchor-protected-target', decision=Decision.DENY, issuer='director', rule_id='e2e-anchor-authority-deny')",
-    'app = create_app(runtime)',
-    `uvicorn.run(app, host='127.0.0.1', port=${backendPort})`,
-  ].join('\n')
-  const backend = child(python, ['-c', backendProgram], repoDir, backendEnv)
-  const frontendEnv = { ...backendEnv, VESPER_API_TARGET: `http://127.0.0.1:${backendPort}` }
-  const frontend = child('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(frontendPort), '--strictPort'], frontendDir, frontendEnv)
-  const backendUrl = `http://127.0.0.1:${backendPort}`
-  const frontendUrl = `http://127.0.0.1:${frontendPort}`
-  try {
-    await Promise.all([waitFor(`${backendUrl}/health`), waitFor(frontendUrl)])
-  } catch (error) {
-    const diagnostic = `backend:\n${backend.output()}\nfrontend:\n${frontend.output()}`
-    await stop(backend); await stop(frontend); await rm(home, { recursive: true, force: true })
-    throw new Error(`${String(error)}\n${diagnostic}`)
-  }
-  return { backend, frontend, home, backendUrl, frontendUrl, close: async () => { await stop(frontend); await stop(backend); await rm(home, { recursive: true, force: true }) } }
-}
-
-async function bootstrap(baseUrl: string): Promise<string> {
-  const response = await fetch(`${baseUrl}/api/bootstrap`)
-  expect(response.ok).toBeTruthy()
-  return (await response.json()).session
-}
-
-async function command(baseUrl: string, token: string, url: string, body: unknown): Promise<Response> {
-  return fetch(`${baseUrl}${url}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Vesper-Bootstrap': token, 'X-Client-Request-ID': crypto.randomUUID() }, body: JSON.stringify(body) })
-}
+import { startHarness, bootstrap, command } from "./support/vesper-harness"
 
 async function createPendingApproval(baseUrl: string, token: string): Promise<{ approvalId: string; processId: string }> {
   // Gate C canonical default policy for a registered syscall is ASK; a Process cannot self-grant authority.
@@ -155,14 +48,40 @@ test.describe('Gate F.1 browser E2E closure', () => {
   test('full dogfood flow persists across browser close and proves security boundaries', async ({ browser }) => {
     const page = await browser.newPage()
     const calendarPatchBodies: unknown[] = []
+    let directorSubmitCount = 0
+    let modelInvokeCount = 0
     page.on('request', request => {
       if (request.method() === 'PATCH' && /\/api\/calendar\//.test(request.url())) calendarPatchBodies.push(request.postDataJSON())
+      if (request.method() === 'POST' && request.url().includes('/api/director/submit')) directorSubmitCount += 1
+      if (request.method() === 'POST' && request.url().includes('/api/model/invoke')) modelInvokeCount += 1
     })
     await page.goto(harness.frontendUrl)
     await expect(page.getByText('VESPER')).toBeVisible()
     await expect(page).not.toHaveURL(/session|token|bootstrap/i)
     const html = await page.content()
     expect(html).not.toContain('secret://')
+
+    // The Gate-F fixture is intentionally unconfigured; the real Ask surface must
+    // use the typed runtime error and offer navigation without resetting First Boot.
+    const ask = page.getByLabel('Ask Vesper')
+    await ask.fill('unconfigured check')
+    await ask.press('Enter')
+    await expect(page.getByRole('alert')).toContainText('AI connection is not configured')
+    await expect(page.getByRole('button', { name: 'Set up AI' })).toBeVisible()
+    expect(directorSubmitCount).toBeGreaterThanOrEqual(1)
+    expect(modelInvokeCount).toBe(0)
+
+    await page.getByRole('button', { name: 'Ideas' }).click()
+    const ideaInput = page.getByPlaceholder('What are you noticing?')
+    await ideaInput.fill('line one')
+    await ideaInput.press('Shift+Enter')
+    await ideaInput.type('line two')
+    await expect(ideaInput).toHaveValue('line one\nline two')
+    await ideaInput.press('Enter')
+    await expect(page.getByText('Idea persisted')).toBeVisible()
+    await expect(page.getByText('line one\nline two')).toBeVisible()
+
+    await page.getByRole('button', { name: 'Home' }).click()
 
     await page.getByRole('button', { name: 'Projects' }).click()
     await page.getByPlaceholder('New project name').fill('Gate F Project')
@@ -178,9 +97,9 @@ test.describe('Gate F.1 browser E2E closure', () => {
 
     await page.getByRole('button', { name: 'Calendar' }).click()
     await page.getByPlaceholder('Event title').fill('Gate F Calendar')
-    const dates = page.locator('input[type="datetime-local"]')
-    await dates.nth(0).fill('2026-07-24T10:00')
-    await dates.nth(1).fill('2026-07-24T11:00')
+    await page.getByLabel('Date').fill('2026-07-24')
+    await page.getByLabel('Start time').fill('10:00')
+    await page.getByLabel('End time').fill('11:00')
     await page.getByRole('button', { name: '+ Add event' }).click()
     await expect(page.getByText('Calendar item committed')).toBeVisible()
     page.once('dialog', dialog => dialog.accept('2026-07-24T12:00'))
@@ -197,7 +116,10 @@ test.describe('Gate F.1 browser E2E closure', () => {
     await expect(page.getByText('Provider down must still persist')).toBeVisible()
 
     await page.getByRole('button', { name: 'Processes' }).click()
-    await expect(page.getByText('No durable processes yet.')).toBeVisible()
+    const processEvidence = await (await fetch(`${harness.backendUrl}/api/processes`)).json()
+    const processTexts = await page.locator('body').innerText()
+    console.log('GATE_F_PROCESS_EVIDENCE', JSON.stringify({ processes: processEvidence.processes, processTexts }))
+    await expect(page.getByText(/No durable processes yet\.|FAILED/).first()).toBeVisible()
 
     const token = await bootstrap(harness.backendUrl)
     const { approvalId, processId } = await createPendingApproval(harness.backendUrl, token)

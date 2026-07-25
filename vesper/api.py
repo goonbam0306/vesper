@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import secrets
+import urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -13,26 +15,37 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import ensure_runtime_dirs, vesper_home
 from .storage import Storage
-from .kernel import Kernel, KernelError, ProcessStatus
+from .kernel import Kernel, KernelError, ProcessExecutionOutcome, ProcessStatus
 from .memory import MemoryStore
 from .context import ContextPack
-from .model_runtime import CognitiveRuntime, ModelRegistry, CognitiveRequest, ProviderAdapters
+from .model_runtime import CognitiveRuntime, ModelRegistry, CognitiveRequest, ProviderAdapters, ModelRoute
 from .syscalls import SyscallEngine, SyscallRequest, SyscallError, ApprovalDecision, EffectStatus
 from .core_apps import CoreApps, CoreAppError
 from .connections import ConnectionStore, ConnectionError
 from .artifacts import ArtifactStore
+from .secret_store import SecretStore, SecretStoreError
+from .provider_adapter import ProviderAdapter, ProviderConnection
+from .conversations import ConversationStore
+
+
+class RuntimeConfigurationError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
 
 
 class Runtime:
-    def __init__(self, home: Path | None = None) -> None:
+    def __init__(self, home: Path | None = None, *, secret_store=None) -> None:
         self.home = home or vesper_home()
         ensure_runtime_dirs(self.home)
         self.storage = Storage(self.home / "vesper.sqlite3")
         self.kernel = Kernel(self.storage)
         self.memory = MemoryStore(self.storage)
         self.models = ModelRegistry(self.storage)
-        self.providers = ProviderAdapters()
+        self.secret_store = secret_store or SecretStore()
+        self.providers = ProviderAdapters(self.secret_store)
         self.cognitive = CognitiveRuntime(self.storage, self.kernel, self.memory, self.models, self.providers)
+        self.conversations = ConversationStore(self.storage)
         self.syscalls = SyscallEngine(self.storage, self.kernel)
         self.core_apps = CoreApps(self.storage)
         self.connections = ConnectionStore(self.storage, artifact_store=ArtifactStore(self.home, self.storage))
@@ -41,9 +54,80 @@ class Runtime:
     def start(self) -> None:
         self.storage.migrate()
         self.storage.start()
+        self.kernel.recover_terminal_intents()
 
     def stop(self) -> None:
         self.storage.stop()
+
+    def submit_director(self, prompt: str, conversation_id: str | None, client_request_id: str, *, principal: str = "director") -> dict:
+        conversation = self.conversations.get(conversation_id) if conversation_id else self.conversations.create()
+        if conversation is None:
+            raise RuntimeConfigurationError("CONVERSATION_NOT_FOUND", "conversation not found")
+        conversation_id = conversation["conversation_id"]
+        self.kernel._submission_metadata = getattr(self.kernel, "_submission_metadata", {})
+        self.kernel._submission_metadata[client_request_id] = {"conversation_id": conversation_id, "principal": principal, "input_ref": "conversation_message"}
+        process = self.kernel.submit("director", client_request_id=client_request_id, priority="INTERACTIVE")
+        user_message = self.conversations.append(conversation_id, "USER", prompt, process_id=process.process_id, client_request_id=client_request_id)
+        def work(process_id: str):
+            task_match = re.search(r"(?:할 일로|태스크로|task로)\s*(.+?)\s*(?:추가해줘|추가해 줘|추가해|만들어줘|생성해줘)\s*$", prompt, re.IGNORECASE)
+            if task_match:
+                title = task_match.group(1).strip().strip('\\"“”')
+                try:
+                    task = self.core_apps.create_task(title, request_id=f"{client_request_id}:action")
+                except CoreAppError as exc:
+                    content = "Task에 추가하지 못했습니다. 실제 저장에 실패했습니다."
+                    assistant = self.conversations.append(conversation_id, "ASSISTANT", content, process_id=process_id, result_process_id=process_id, client_request_id=client_request_id)
+                    return ProcessExecutionOutcome(ProcessStatus.FAILED, {"status": "ACTION_FAILED", "output": content, "action": {"entity_type": "task", "supported_chat_action": "CREATE_TASK", "commit_status": "FAILED", "error_code": getattr(exc, "code", "TASK_CREATE_FAILED"), "message": str(exc)}, "assistant_message_id": assistant["message_id"], "user_message_id": user_message["message_id"]})
+                content = f"Task에 추가했습니다: {task['title']}"
+                receipt = {"entity_type": "task", "action_type": "CREATE_TASK", "task_id": task["task_id"], "title": task["title"], "commit_status": "COMMITTED", "task": task}
+                assistant = self.conversations.append(conversation_id, "ASSISTANT", content, process_id=process_id, result_process_id=process_id, client_request_id=client_request_id)
+                return ProcessExecutionOutcome(ProcessStatus.COMPLETED, {"status": "ACTION_COMMITTED", "output": content, "action": receipt, "assistant_message_id": assistant["message_id"], "user_message_id": user_message["message_id"]})
+            context_items = self.conversations.context_items(conversation_id, prompt)
+            output = self.invoke_default_model(process_id, prompt, context_items=context_items)
+            if not output or not output.strip():
+                raise RuntimeConfigurationError("MODEL_EMPTY_OUTPUT", "model returned an empty response")
+            attempt = self.storage.write(lambda c: c.execute("SELECT attempt_id FROM cognitive_attempts WHERE process_id=? ORDER BY created_at DESC LIMIT 1", (process_id,)).fetchone())
+            attempt_id = attempt["attempt_id"] if attempt else None
+            assistant = self.conversations.append(conversation_id, "ASSISTANT", output, process_id=process_id, result_process_id=process_id, attempt_id=attempt_id, client_request_id=client_request_id)
+            return ProcessExecutionOutcome(ProcessStatus.COMPLETED, {"status": "MODEL_READY", "output": output, "assistant_message_id": assistant["message_id"], "user_message_id": user_message["message_id"], "attempt_id": attempt_id, "context_item_count": len(context_items)})
+        self.kernel.register_handler(process.process_id, work)
+        self.kernel.run_scheduler(max_slices=1)
+        final = self.kernel.get(process.process_id)
+        result = self.storage.write(lambda c: c.execute("SELECT outputs_json,effects_json FROM process_results WHERE process_id=?", (process.process_id,)).fetchone())
+        payload = __import__("json").loads(result["outputs_json"]) if result else {"status": "FAILED", "output": "Vesper couldn't complete that request."}
+        payload.update({"conversation_id": conversation_id, "process_id": process.process_id, "user_message": user_message, "process": final.__dict__ if final else None})
+        if "empty response" in str(payload.get("error", "")).lower() or payload.get("status") == "FAILED" and payload.get("error") == "MODEL_EMPTY_OUTPUT":
+            self.conversations.append(conversation_id, "ERROR", "Vesper가 응답을 생성하지 못했습니다.", process_id=process.process_id, result_process_id=process.process_id, client_request_id=client_request_id)
+            raise RuntimeConfigurationError("MODEL_EMPTY_OUTPUT", "model returned an empty response")
+        if "assistant_message_id" in payload:
+            payload["assistant_message"] = next((m for m in self.conversations.messages(conversation_id) if m["message_id"] == payload["assistant_message_id"]), None)
+        return payload
+
+    def resolve_default_model_route(self) -> ModelRoute:
+        settings = self.core_apps.settings()
+        spec = settings.get("model_route") or {}
+        if spec.get("status") != "configured":
+            raise RuntimeConfigurationError("MODEL_NOT_CONFIGURED", "default model is not configured")
+        connection_id = str(spec.get("connection_id", ""))
+        model_id = str(spec.get("model_id", ""))
+        if not model_id:
+            raise RuntimeConfigurationError("MODEL_NOT_CONFIGURED", "default model is missing")
+        if not connection_id:
+            raise RuntimeConfigurationError("CONNECTION_NOT_FOUND", "default connection is missing")
+        row = self.storage.write(lambda c: c.execute("SELECT * FROM provider_connections WHERE connection_id=?", (connection_id,)).fetchone())
+        if row is None:
+            raise RuntimeConfigurationError("CONNECTION_NOT_FOUND", "default connection is unavailable")
+        if not row["credential_ref"]:
+            raise RuntimeConfigurationError("CREDENTIAL_NOT_CONFIGURED", "default connection has no credential")
+        return ModelRoute("default-runtime", model_id, row["provider"], frozenset({"text"}), "local" if row["endpoint_type"] == "local" else "remote", .9, 0.0, 1000.0, True, row["credential_ref"], row["base_url"], connection_id, row["api_style"], row["endpoint_type"], row["max_output_tokens"] if "max_output_tokens" in row.keys() else None)
+
+    def invoke_default_model(self, process_id: str, prompt: str, *, context_items: list[dict[str, str]] | None = None) -> str:
+        route = self.resolve_default_model_route()
+        call_contract = {"prompt": prompt, "conversation_context": context_items or []}
+        result = self.cognitive.invoke_model(process_id, CognitiveRequest(privacy="local_preferred"), call_contract, route=route)
+        if not result.success or result.output is None:
+            raise RuntimeConfigurationError(result.response.error or "MODEL_INVOCATION_FAILED", "default model invocation failed")
+        return result.output
 
 
 
@@ -188,6 +272,50 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         pack = ContextPack.build(dict(body.get("frames", {})), fault=body.get("fault"))
         return {"pack_id": pack.pack_id, "serialized": pack.serialize(), "wire_prefix": pack.wire_prefix()}
 
+    @app.post("/api/director/submit")
+    async def director_submit(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        request_id = client_request_id or str(body.get("client_request_id") or secrets.token_urlsafe(18))
+        prompt = str(body.get("input", body.get("prompt", ""))).strip()
+        if not prompt:
+            raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "input is required"})
+        try:
+            return instance.submit_director(prompt, body.get("conversation_id"), request_id, principal=str(body.get("principal", "director")))
+        except RuntimeConfigurationError as exc:
+            raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)}) from exc
+
+    @app.post("/api/model/invoke")
+    async def invoke_model(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        """Deprecated thin adapter; execution authority is director.submit."""
+        body = await request.json()
+        body["input"] = body.get("input", body.get("prompt", "Reply with exactly: VESPER_READY"))
+        request_id = client_request_id or body.get("client_request_id")
+        if request_id:
+            body["client_request_id"] = request_id
+        class _Request:
+            async def json(self): return body
+        try:
+            return await director_submit(_Request(), client_request_id=request_id)  # type: ignore[arg-type]
+        except RuntimeConfigurationError as exc:
+            raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)}) from exc
+
+    @app.get("/api/conversations")
+    def list_conversations():
+        return {"conversations": instance.conversations.list()}
+
+    @app.post("/api/conversations")
+    async def create_conversation(request: Request):
+        body = await request.json()
+        process_id = str(body.get("process_id") or instance.kernel.submit("director", volatile=False).process_id)
+        return {"conversation": instance.conversations.create(process_id)}
+
+    @app.get("/api/conversations/{conversation_id}")
+    def get_conversation(conversation_id: str):
+        conversation = instance.conversations.get(conversation_id)
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        return {"conversation": conversation, "messages": instance.conversations.messages(conversation_id)}
+
     @app.post("/api/model/route")
     async def model_route(request: Request):
         body = await request.json()
@@ -323,6 +451,81 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         result["web_research"] = {"status": "available" if instance.connections.list_capability_stats().get("authorized", 0) else "unconfigured"}
         return result
 
+    @app.get("/api/first-boot")
+    def first_boot_status():
+        settings = instance.core_apps.settings()
+        return {
+            "first_boot_completed": bool(settings.get("first_boot_completed", False)),
+            "director_display_name": settings.get("director_display_name"),
+            "model_route": settings.get("model_route", {"status": "unconfigured"}),
+        }
+
+    @app.post("/api/first-boot/connection")
+    async def first_boot_connection(request: Request):
+        body = await request.json()
+        provider = str(body.get("provider", "custom"))
+        display_name = str(body.get("display_name", provider)).strip()
+        base_url = str(body.get("base_url", "")).strip().rstrip("/")
+        api_style = str(body.get("api_style", "official"))
+        model_id = str(body.get("model_id", "")).strip()
+        credential = body.get("credential")
+        if not display_name or not base_url:
+            raise HTTPException(status_code=422, detail={"code": "INVALID_CONNECTION", "message": "A display name and endpoint URL are required."})
+        if credential is not None and not isinstance(credential, str):
+            raise HTTPException(status_code=422, detail={"code": "INVALID_CREDENTIAL", "message": "Credential must be text."})
+        endpoint_type = "local" if provider == "local" or api_style == "local-compatible" else "custom"
+        credential_ref = None
+        try:
+            if credential:
+                credential_ref = instance.secret_store.put(credential, label=provider)
+            connection = ProviderConnection("pending", provider, base_url, model_id, api_style, credential_ref, endpoint_type)
+            result = ProviderAdapter(connection, instance.secret_store).validate_and_invoke()
+            if result.status != "MODEL_READY":
+                raise HTTPException(status_code=422, detail={"code": "CONNECTION_VALIDATION_FAILED", "message": "Vesper could not validate this connection. Check the endpoint, model, and credential, then try again."})
+        except HTTPException:
+            if credential_ref:
+                instance.secret_store.delete(credential_ref)
+            raise
+        except Exception as exc:
+            if credential_ref:
+                instance.secret_store.delete(credential_ref)
+            raise HTTPException(status_code=422, detail={"code": "CONNECTION_VALIDATION_FAILED", "message": "Vesper could not validate this connection. Check the endpoint, model, and credential, then try again."}) from exc
+        connection_id = f"{provider}-{secrets.token_hex(6)}"
+        try:
+            connection = instance.connections.register_provider_connection(connection_id=connection_id, display_name=display_name, base_url=base_url, api_style=api_style, credential_ref=credential_ref, endpoint_type=endpoint_type, provider=provider)
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+        return {"connection": {"connection_id": connection["connection_id"], "display_name": connection["display_name"], "base_url": connection["base_url"], "api_style": connection["api_style"], "has_credential": bool(credential_ref)}, "models": [model_id] if model_id else []}
+
+    @app.post("/api/first-boot/complete")
+    async def complete_first_boot(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
+        body = await request.json()
+        director_display_name = str(body.get("director_display_name", "")).strip()
+        if not director_display_name:
+            raise HTTPException(status_code=422, detail={"code": "DIRECTOR_NAME_REQUIRED", "message": "Director display name is required."})
+        model_route = body.get("model_route", {"status": "unconfigured"})
+        if not isinstance(model_route, dict):
+            raise HTTPException(status_code=422, detail={"code": "INVALID_MODEL_ROUTE", "message": "Default model is invalid."})
+        if model_route.get("status") == "configured":
+            connection_id = str(model_route.get("connection_id", ""))
+            row = instance.storage.write(lambda c: c.execute("SELECT * FROM provider_connections WHERE connection_id=?", (connection_id,)).fetchone())
+            if row is None:
+                raise HTTPException(status_code=422, detail={"code": "INVALID_MODEL_ROUTE", "message": "The selected provider connection is unavailable."})
+            route = ModelRoute(
+                route_id="default-runtime",
+                model_id=str(model_route.get("model_id", "")),
+                provider=str(row["provider"] or model_route.get("provider", "custom")),
+                capabilities=frozenset({"text"}), privacy="local" if model_route.get("endpoint_type") == "local" else "remote",
+                reliability=0.9, cost=0.0, latency_ms=1000.0, enabled=True,
+                credential_ref=row["credential_ref"], base_url=row["base_url"], connection_id=connection_id,
+                api_style=row["api_style"], endpoint_type=model_route.get("endpoint_type", "custom"),
+                max_output_tokens=model_route.get("max_output_tokens"),
+            )
+            instance.models.register(route)
+            model_route = {"status": "configured", "route_id": route.route_id, "connection_id": connection_id, "model_id": route.model_id, "provider": route.provider}
+        settings = instance.core_apps.update_settings({"director_display_name": director_display_name, "model_route": model_route, "first_boot_completed": True}, client_request_id)
+        return {"settings": settings}
+
     @app.post("/api/settings")
     async def update_settings(request: Request, client_request_id: str | None = Header(default=None, alias="X-Client-Request-ID")):
         body = await request.json()
@@ -377,6 +580,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 for item in capabilities
             ],
             "stats": instance.connections.list_capability_stats(),
+            "provider_connections": instance.connections.provider_connections(),
         }
 
     @app.get("/api/capabilities/search")

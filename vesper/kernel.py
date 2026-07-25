@@ -83,6 +83,14 @@ class ProcessNotFound(KernelError):
 
 
 @dataclass(frozen=True)
+class ProcessExecutionOutcome:
+    terminal_status: ProcessStatus
+    outputs: dict[str, Any] = field(default_factory=dict)
+    effects: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class Process:
     process_id: str
     status: str
@@ -180,7 +188,28 @@ class Kernel:
         self.storage = storage
         self._volatile: dict[str, Process] = {}
         self._volatile_waits: dict[str, tuple[WaitReason, str]] = {}
+        self._handlers: dict[str, Any] = {}
         self.scheduler = ProcessScheduler()
+
+    def register_handler(self, process_id: str, handler: Any) -> None:
+        self._handlers[process_id] = handler
+
+    def _execute_scheduled(self, process_id: str) -> None:
+        handler = self._handlers.pop(process_id, None)
+        if handler is None:
+            return
+        try:
+            outcome = handler(process_id)
+            if not isinstance(outcome, ProcessExecutionOutcome):
+                raise KernelError("handler must return ProcessExecutionOutcome")
+            self.result(process_id, outcome.outputs, outcome.effects, terminal_status=outcome.terminal_status)
+            self.transition(process_id, outcome.terminal_status)
+        except Exception as exc:
+            try:
+                self.result(process_id, {"error": str(exc)}, {"status": "FAILED"}, terminal_status=ProcessStatus.FAILED)
+                self.transition(process_id, ProcessStatus.FAILED)
+            except Exception:
+                pass
 
     @staticmethod
     def _now() -> str:
@@ -262,7 +291,7 @@ class Kernel:
                     if old["command_json"] != command:
                         raise IdempotencyConflict(client_request_id)
                     return self._load(conn, json.loads(old["result_json"])["process_id"])
-            event = self._event(conn, pid, "PROCESS_CREATED", {"origin": origin})
+            event = self._event(conn, pid, "PROCESS_CREATED", {"origin": origin, "client_request_id": client_request_id, "submission": getattr(self, "_submission_metadata", {}).get(client_request_id, {})})
             conn.execute("INSERT INTO processes(process_id,status,origin,entry_event_id,created_at,updated_at,volatile) VALUES(?,?,?,?,?,?,0)", (pid, ProcessStatus.CREATED, origin, event, now, now))
             conn.execute("INSERT INTO process_authority(process_id,authority_json,delegable_authority_json) VALUES(?,?,?)", (pid, json.dumps(normalized_authority), json.dumps(normalized_delegable)))
             if client_request_id:
@@ -442,15 +471,36 @@ class Kernel:
             self._record_cursor(conn)
         self.storage.write(op)
 
-    def result(self, process_id: str, outputs: dict[str, Any], effects: dict[str, Any] | None = None) -> Process:
+    def result(self, process_id: str, outputs: dict[str, Any], effects: dict[str, Any] | None = None, *, terminal_status: ProcessStatus = ProcessStatus.COMPLETED) -> Process:
         effects = effects or {}
+        if terminal_status not in {*TERMINAL, ProcessStatus.WAITING}:
+            raise KernelError("INVALID_TERMINAL_INTENT")
         def op(conn: sqlite3.Connection) -> Process:
             process = self._load(conn, process_id)
-            if process is None or ProcessStatus(process.status) not in TERMINAL:
-                raise KernelError("PROCESS_MUST_BE_TERMINAL")
-            conn.execute("INSERT INTO process_results(process_id,outputs_json,effects_json) VALUES(?,?,?)", (process_id, json.dumps(outputs), json.dumps(effects)))
+            if process is None or ProcessStatus(process.status) not in {*TERMINAL, ProcessStatus.RUNNING}:
+                raise KernelError("PROCESS_MUST_BE_RUNNING_OR_TERMINAL")
+            conn.execute("INSERT INTO process_results(process_id,outputs_json,effects_json,terminal_status) VALUES(?,?,?,?)", (process_id, json.dumps(outputs), json.dumps(effects), terminal_status.value))
             return process
         return self.storage.write(op)
+
+    def recover_terminal_intents(self) -> list[Process]:
+        """Converge RUNNING processes with an already durable generic result.
+
+        Recovery reads only the kernel-owned terminal_status column. Application
+        output and effect payloads are deliberately opaque to this method.
+        """
+        def read(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+            return [(row["process_id"], row["terminal_status"]) for row in conn.execute(
+                "SELECT p.process_id, r.terminal_status FROM processes p JOIN process_results r USING(process_id) WHERE p.status=?",
+                (ProcessStatus.RUNNING.value,),
+            ).fetchall()]
+        recovered: list[Process] = []
+        for process_id, status in self.storage.write(read):
+            try:
+                recovered.append(self.transition(process_id, ProcessStatus(status)))
+            except (InvalidTransition, ValueError):
+                continue
+        return recovered
 
     def snapshot(self) -> dict[str, Any]:
         def read(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -479,6 +529,7 @@ class Kernel:
                 continue
             try:
                 ran.append(self.transition(item.process_id, ProcessStatus.RUNNING))
+                self._execute_scheduled(item.process_id)
             except InvalidTransition:
                 continue
         return ran
