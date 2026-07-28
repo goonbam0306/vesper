@@ -66,13 +66,20 @@ class Runtime:
         self.syscalls = SyscallEngine(self.storage, self.kernel)
         self.core_apps = CoreApps(self.storage)
         self.connections = ConnectionStore(self.storage, artifact_store=ArtifactStore(self.home, self.storage))
-        self.candidate_reviews = CandidateReviewStore()
+        self.candidate_reviews = CandidateReviewStore(self.storage)
         self.bootstrap_token = secrets.token_urlsafe(32)
 
     def start(self) -> None:
+        """Start storage and reconcile every recoverable Kernel-owned state.
+
+        Recovery is deliberately ordered: durable terminal intents are applied
+        first; any remaining in-flight process is paused rather than guessed
+        complete. The same pass also reconciles graph/wait metadata through the
+        Kernel recovery hook, so restart cannot silently lose uncertainty.
+        """
         self.storage.migrate()
         self.storage.start()
-        self.kernel.recover_terminal_intents()
+        self.kernel.reconcile_startup()
 
     def stop(self) -> None:
         self.storage.stop()
@@ -267,7 +274,7 @@ fetch('/api/bootstrap').then(r=>r.json()).then(d=>{bootstrapToken=d.session; win
 
     @app.get("/api/candidate-reviews")
     def list_candidate_reviews():
-        return {"reviews": [review_payload(item) for item in instance.candidate_reviews._reviews.values()]}
+        return {"reviews": [review_payload(item) for item in instance.candidate_reviews.list()]}
 
     @app.get("/api/lanes")
     def list_lanes(lane_id: str | None = None):

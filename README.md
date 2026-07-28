@@ -1,15 +1,30 @@
-# vesper
+# Vesper
 
-## Implementation status
+Vesper is a local-first deterministic runtime whose Kernel validates and executes proposed work.
 
-### Phase 6C-03 — Validated routing dispatch boundary
+## Closure status
 
-**IMPLEMENTED**
+The authoritative v1 closure contract is [`docs/VESPER_V1_CLOSURE_SPEC.md`](docs/VESPER_V1_CLOSURE_SPEC.md).
+Executable evidence and the current seal conclusion are maintained in [`docs/VESPER_V1_CLOSURE_STATUS.md`](docs/VESPER_V1_CLOSURE_STATUS.md).
 
-Validated routing proposals now have a deterministic runtime dispatch boundary. The boundary is limited to DIRECT, LANE, GRAPH-deferred, and FALLBACK materialization; it does not execute Lane cognition or provide ExecutionGraph runtime semantics.
+Current repository status: **VESPER V1 NOT SEALED** until all applicable closure gates pass and the required Director decisions are recorded.
 
-### Phase 6D-00 — Adaptive execution contracts
+## Verification
 
-**IMPLEMENTED**
+```bash
+pip install -e '.[test]'
+pytest -q
+git diff --check
+```
 
-Immutable `LaneOutcome`, `ContextNeed`, `WorkExpansionProposal`, `ProposedWorkUnit`, and `GraphRevisionRequest` contracts are validated deterministically. They communicate Lane control results without creating LaneInvocations, mutating the Execution Graph, loading context, invoking models, or changing Process state. Dynamic expansion, replanning, fallback fingerprinting, and Lane cognition remain future phases.
+## Runtime boundaries
+
+Validated routing is limited to DIRECT, LANE, GRAPH-deferred, and FALLBACK materialization. The Kernel remains deterministic authority; cognition is replaceable and proposals require validation before effects.
+
+## Historical implementation notes
+
+Earlier phase implementation notes remain in repository history. They are not seal evidence; use the closure status document and executable tests as the source of truth.
+
+## License
+
+See repository metadata for licensing.

@@ -49,6 +49,7 @@ class AbstractionCandidate:
     canonical_function: str
     recommended_abstraction: str
     activation_status: str = "PENDING_DIRECTOR_APPROVAL"
+    recommendation_reason: str = ""
 
 
 class CandidateBuilder:
@@ -60,7 +61,12 @@ class CandidateBuilder:
         if any(fingerprints[0].similarity(item) < threshold for item in fingerprints[1:]):
             raise ValueError("fallback cluster is not structurally stable")
         canonical = values[0].cognitive_operations[0] if values[0].cognitive_operations else "fallback-cognition"
-        return AbstractionCandidate(tuple(value.fallback_id for value in values), canonical, "SKILL")
+        # A stable cluster alone is not enough to recommend a Lane. Lane
+        # promotion requires a separately identified operational contract;
+        # absent that explicit signal, preserve the safer SKILL recommendation.
+        recommendation = "SKILL"
+        reason = "repeated stable operational contract" if recommendation == "LANE" else "reusable cognitive pattern"
+        return AbstractionCandidate(tuple(value.fallback_id for value in values), canonical, recommendation, recommendation_reason=reason)
 
 
 __all__ = ["AbstractionCandidate", "CandidateBuilder", "FallbackFingerprint", "FallbackRecord"]

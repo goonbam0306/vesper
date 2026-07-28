@@ -483,6 +483,17 @@ class Kernel:
             return process
         return self.storage.write(op)
 
+    def reconcile_startup(self) -> dict[str, tuple[str, ...]]:
+        """Run the complete conservative startup reconciliation pass.
+
+        Terminal intents are authoritative and are applied first. Remaining
+        RUNNING work is uncertain after a stop/crash, so it is paused and
+        surfaced for explicit retry instead of being marked complete.
+        """
+        terminal = tuple(process.process_id for process in self.recover_terminal_intents())
+        paused = self.recover_running_processes()
+        return {"terminal_intents": terminal, "paused_uncertain": paused}
+
     def recover_terminal_intents(self) -> list[Process]:
         """Converge RUNNING processes with an already durable generic result.
 
@@ -530,7 +541,39 @@ class Kernel:
             return {"events": events, "cursor": next_cursor}
         return self.storage.write(read)
 
-    def run_scheduler(self, *, max_slices: int = 1) -> list[Process]:
+    def reconcile_scheduled_work(self, *, now: Any) -> dict[str, tuple[str, ...]]:
+        """Claim due durable wake work and enqueue it through the Kernel scheduler."""
+        from .process_policy import ProcessRecurrenceStore, ProcessTimerStore
+
+        timers = ProcessTimerStore(self.storage)
+        claimed_timers: list[str] = []
+        for process_id, wake_key in timers.due(now=now):
+            if timers.claim(process_id):
+                self.wake(wake_key)
+                claimed_timers.append(process_id)
+
+        recurrence = ProcessRecurrenceStore(self.storage)
+        recurrence_ids = self.storage.write(
+            lambda conn: tuple(
+                row["process_id"] for row in conn.execute(
+                    "SELECT process_id FROM process_recurrences "
+                    "WHERE run_count < max_runs AND next_due_at IS NOT NULL AND next_due_at <= ? "
+                    "ORDER BY next_due_at, process_id", (now.isoformat() if hasattr(now, "isoformat") else str(now),)
+                ).fetchall()
+            )
+        )
+        scheduled_recurrence: list[str] = []
+        for process_id in recurrence_ids:
+            if recurrence.next_run(process_id, now=now.isoformat() if hasattr(now, "isoformat") else str(now)) is not None:
+                process = self.get(process_id)
+                if process and ProcessStatus(process.status) in {ProcessStatus.CREATED, ProcessStatus.PAUSED}:
+                    self.scheduler.enqueue(process_id, self._priority(process.priority))
+                    scheduled_recurrence.append(process_id)
+        return {"timers": tuple(claimed_timers), "recurrence": tuple(scheduled_recurrence)}
+
+    def run_scheduler(self, *, max_slices: int = 1, now: Any | None = None) -> list[Process]:
+        if now is not None:
+            self.reconcile_scheduled_work(now=now)
         ran: list[Process] = []
         for _ in range(max_slices):
             item = self.scheduler.next()

@@ -5,6 +5,7 @@ import hashlib
 import os
 import tempfile
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -184,8 +185,19 @@ class ArtifactStore:
             target = destination / row["artifact_id"].replace(":", "_")
             target.write_bytes(source.read_bytes())
             exported.append({"artifact_id": row["artifact_id"], "sha256": row["sha256"], "byte_size": row["byte_size"], "media_type": row["media_type"]})
-        manifest = {"format": "vesper-safe-export-v1", "artifacts": exported}
-        (destination / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        manifest = {
+            "format": "vesper-safe-export-v1",
+            "export_id": str(uuid.uuid4()),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "database": "local-sqlite",
+            "artifacts": exported,
+        }
+        temporary_manifest = destination / ".manifest.json.tmp"
+        temporary_manifest.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        with temporary_manifest.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary_manifest, destination / "manifest.json")
+        self._fsync_directory(destination)
         return manifest
 
     def _content_files(self):

@@ -88,17 +88,35 @@ class ProcessPolicyStore:
 
 
 class ProcessBudget:
-    def __init__(self, *, tokens: int, seconds: int) -> None:
+    def __init__(self, *, tokens: int, seconds: int, storage: Any | None = None, process_id: str | None = None) -> None:
         if tokens < 0 or seconds < 0:
             raise ValueError("budgets cannot be negative")
         self.tokens = tokens
         self.seconds = seconds
+        self.storage = storage
+        self.process_id = process_id
+
+    @classmethod
+    def load(cls, storage: Any, process_id: str, *, default_tokens: int, default_seconds: int) -> "ProcessBudget":
+        row = storage.write(lambda c: c.execute("SELECT budget_tokens_remaining,budget_seconds_remaining FROM process_runtime_state WHERE process_id=?", (process_id,)).fetchone())
+        if row is None:
+            budget = cls(tokens=default_tokens, seconds=default_seconds, storage=storage, process_id=process_id)
+            budget._persist()
+            return budget
+        return cls(tokens=int(row["budget_tokens_remaining"]), seconds=int(row["budget_seconds_remaining"]), storage=storage, process_id=process_id)
+
+    def _persist(self) -> None:
+        if self.storage is None or self.process_id is None:
+            return
+        from datetime import datetime, timezone
+        self.storage.write(lambda c: c.execute("INSERT INTO process_runtime_state(process_id,budget_tokens_remaining,budget_seconds_remaining,updated_at) VALUES(?,?,?,?) ON CONFLICT(process_id) DO UPDATE SET budget_tokens_remaining=excluded.budget_tokens_remaining,budget_seconds_remaining=excluded.budget_seconds_remaining,updated_at=excluded.updated_at", (self.process_id, self.tokens, self.seconds, datetime.now(timezone.utc).isoformat())))
 
     def consume(self, *, tokens: int, seconds: int) -> bool:
         if tokens < 0 or seconds < 0 or tokens > self.tokens or seconds > self.seconds:
             return False
         self.tokens -= tokens
         self.seconds -= seconds
+        self._persist()
         return True
 
     def replenish(self, *, tokens: int, seconds: int) -> None:
@@ -106,6 +124,7 @@ class ProcessBudget:
             raise ValueError("replenishment cannot be negative")
         self.tokens += tokens
         self.seconds += seconds
+        self._persist()
 
 
 class ProcessTimerStore:
@@ -153,13 +172,27 @@ class ProcessRecurrenceStore:
 
 
 class ProcessMonitor:
-    def __init__(self, *, cadence_seconds: int, max_checks: int) -> None:
+    def __init__(self, *, cadence_seconds: int, max_checks: int, storage: Any | None = None, process_id: str | None = None, last_check: int | None = None, checks: int = 0) -> None:
+        if cadence_seconds < 1 or max_checks < 1 or checks < 0:
+            raise ValueError("invalid monitor bounds or state")
         self.cadence_seconds, self.max_checks = cadence_seconds, max_checks
-        self._last: int | None = None
-        self._checks = 0
+        self.storage, self.process_id = storage, process_id
+        self._last, self._checks = last_check, checks
+
+    @classmethod
+    def load(cls, storage: Any, process_id: str, *, cadence_seconds: int, max_checks: int) -> "ProcessMonitor":
+        row = storage.write(lambda c: c.execute("SELECT monitor_last_check,monitor_checks FROM process_runtime_state WHERE process_id=?", (process_id,)).fetchone())
+        return cls(cadence_seconds=cadence_seconds, max_checks=max_checks, storage=storage, process_id=process_id, last_check=(int(row["monitor_last_check"]) if row and row["monitor_last_check"] is not None else None), checks=(int(row["monitor_checks"]) if row else 0))
+
+    def _persist(self) -> None:
+        if self.storage is None or self.process_id is None:
+            return
+        from datetime import datetime, timezone
+        self.storage.write(lambda c: c.execute("INSERT INTO process_runtime_state(process_id,monitor_last_check,monitor_checks,updated_at) VALUES(?,?,?,?) ON CONFLICT(process_id) DO UPDATE SET monitor_last_check=excluded.monitor_last_check,monitor_checks=excluded.monitor_checks,updated_at=excluded.updated_at", (self.process_id, self._last, self._checks, datetime.now(timezone.utc).isoformat())))
 
     def check(self, *, now: int, condition: Any) -> bool | None:
         if self._checks >= self.max_checks or (self._last is not None and now - self._last < self.cadence_seconds):
             return None
         self._last, self._checks = now, self._checks + 1
+        self._persist()
         return bool(condition())

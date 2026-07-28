@@ -61,7 +61,7 @@ class ApprovedFileApply:
         if not patch_set.operations:
             raise FileApplyError("PatchSet must contain at least one operation")
 
-        prepared: list[tuple[Path, str, Path]] = []
+        prepared: list[tuple[Path, str, Path, Path]] = []
         seen: set[Path] = set()
         temporary_dir = Path(tempfile.mkdtemp(prefix="vesper-apply-", dir=root))
         try:
@@ -77,10 +77,19 @@ class ApprovedFileApply:
                     raise FileApplyError(f"stale patch content: {operation.path}")
                 temporary = temporary_dir / str(len(prepared))
                 temporary.write_text(operation.new_text, encoding="utf-8")
-                prepared.append((destination, operation.path, temporary))
+                backup = temporary_dir / f"backup-{len(prepared)}"
+                backup.write_bytes(destination.read_bytes())
+                prepared.append((destination, operation.path, temporary, backup))
 
-            for destination, _, temporary in prepared:
-                os.replace(temporary, destination)
+            replaced: list[tuple[Path, Path]] = []
+            try:
+                for destination, _, temporary, backup in prepared:
+                    os.replace(temporary, destination)
+                    replaced.append((destination, backup))
+            except OSError as exc:
+                for destination, backup in reversed(replaced):
+                    os.replace(backup, destination)
+                raise FileApplyError(str(exc)) from exc
             return ApplyResult(patch_set.patch_id, approval.approval_id, tuple(item[1] for item in prepared))
         except FileApplyError:
             raise

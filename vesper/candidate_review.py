@@ -4,9 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
+import json
+import uuid
 from typing import Any
 
 from .fallbacks import AbstractionCandidate
+from .storage import Storage
 
 
 class CandidateReviewError(ValueError):
@@ -26,8 +29,80 @@ class CandidateReview:
 
 
 class CandidateReviewStore:
-    def __init__(self) -> None:
+    def __init__(self, storage: Storage | None = None) -> None:
+        self.storage = storage
         self._reviews: dict[tuple[str, ...], CandidateReview] = {}
+
+    @staticmethod
+    def _key(candidate: AbstractionCandidate) -> str:
+        return sha256("|".join(candidate.supporting_fallback_ids).encode()).hexdigest()
+
+    def _persist(self, review: CandidateReview) -> None:
+        if self.storage is None:
+            self._reviews[review.candidate.supporting_fallback_ids] = review
+            return
+        candidate = review.candidate
+        payload = {
+            "candidate_key": self._key(candidate),
+            "supporting_fallback_ids_json": json.dumps(candidate.supporting_fallback_ids),
+            "canonical_function": candidate.canonical_function,
+            "recommended_abstraction": candidate.recommended_abstraction,
+            "recommendation_reason": candidate.recommendation_reason,
+            "activation_status": candidate.activation_status,
+            "reviewer": review.reviewer,
+            "evidence_json": json.dumps(review.evidence),
+            "decision": review.decision,
+            "note": review.note,
+            "approval_id": review.approval_id,
+            "decided_at": review.decided_at,
+            "activated": int(review.activated),
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.storage.write(lambda conn: conn.execute(
+            """INSERT OR REPLACE INTO candidate_reviews
+            (candidate_key, supporting_fallback_ids_json, canonical_function,
+             recommended_abstraction, recommendation_reason, activation_status, reviewer, evidence_json,
+             decision, note, approval_id, decided_at, activated, submitted_at)
+            VALUES (:candidate_key, :supporting_fallback_ids_json, :canonical_function,
+             :recommended_abstraction, :recommendation_reason, :activation_status, :reviewer, :evidence_json,
+             :decision, :note, :approval_id, :decided_at, :activated, :submitted_at)""",
+            payload,
+        ))
+
+    def _load(self, candidate: AbstractionCandidate) -> CandidateReview:
+        if self.storage is None:
+            return self._reviews[candidate.supporting_fallback_ids]
+        row = self.storage.connect().execute(
+            "SELECT * FROM candidate_reviews WHERE candidate_key = ?", (self._key(candidate),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(candidate.supporting_fallback_ids)
+        return CandidateReview(
+            candidate=candidate,
+            reviewer=row["reviewer"],
+            evidence=tuple(json.loads(row["evidence_json"])),
+            decision=row["decision"],
+            note=row["note"],
+            approval_id=row["approval_id"],
+            decided_at=row["decided_at"],
+            activated=bool(row["activated"]),
+        )
+
+    def list(self) -> tuple[CandidateReview, ...]:
+        if self.storage is None:
+            return tuple(self._reviews.values())
+        rows = self.storage.connect().execute(
+            "SELECT * FROM candidate_reviews ORDER BY submitted_at, candidate_key"
+        ).fetchall()
+        return tuple(
+            self._load(AbstractionCandidate(
+                tuple(json.loads(row["supporting_fallback_ids_json"])),
+                row["canonical_function"],
+                row["recommended_abstraction"],
+                row["activation_status"],
+                row["recommendation_reason"],
+            )) for row in rows
+        )
 
     def submit(self, candidate: AbstractionCandidate, *, reviewer: str, evidence: tuple[str, ...]) -> CandidateReview:
         if not reviewer.strip():
@@ -35,12 +110,12 @@ class CandidateReviewStore:
         if not evidence:
             raise CandidateReviewError("review evidence is required")
         review = CandidateReview(candidate, reviewer, tuple(evidence))
-        self._reviews[candidate.supporting_fallback_ids] = review
+        self._persist(review)
         return review
 
     def get(self, candidate: AbstractionCandidate) -> CandidateReview:
         try:
-            return self._reviews[candidate.supporting_fallback_ids]
+            return self._load(candidate)
         except KeyError as exc:
             raise CandidateReviewError("candidate has not been submitted for review") from exc
 
@@ -51,7 +126,15 @@ class CandidateReviewStore:
         if current.activated:
             return current
         updated = CandidateReview(current.candidate, current.reviewer, current.evidence, current.decision, current.note, current.approval_id, current.decided_at, True)
-        self._reviews[candidate.supporting_fallback_ids] = updated
+        self._persist(updated)
+        if self.storage is not None:
+            self.storage.write(lambda conn: conn.execute(
+                """INSERT INTO candidate_activation_audit
+                (audit_id, candidate_key, approval_id, actor, activated_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (str(uuid.uuid4()), self._key(candidate), approval_id, current.reviewer,
+                 datetime.now(timezone.utc).isoformat()),
+            ))
         return updated
 
     def decide(self, candidate: AbstractionCandidate, *, reviewer: str, approved: bool, note: str = "") -> CandidateReview:
@@ -64,7 +147,7 @@ class CandidateReviewStore:
         decided_at = datetime.now(timezone.utc).isoformat()
         approval_id = sha256("|".join((*candidate.supporting_fallback_ids, reviewer, decision, decided_at)).encode()).hexdigest()[:24]
         updated = CandidateReview(current.candidate, current.reviewer, current.evidence, decision, note, approval_id, decided_at, False)
-        self._reviews[candidate.supporting_fallback_ids] = updated
+        self._persist(updated)
         return updated
 
 
