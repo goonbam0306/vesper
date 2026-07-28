@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import ensure_runtime_dirs, vesper_home
@@ -26,6 +26,18 @@ from .artifacts import ArtifactStore
 from .secret_store import SecretStore, SecretStoreError
 from .provider_adapter import ProviderAdapter, ProviderConnection
 from .conversations import ConversationStore
+from .lanes import (
+    LaneDefinition,
+    LaneDuplicateError,
+    LaneError,
+    LaneInvalidError,
+    LaneNotFoundError,
+    LaneRegistry,
+    LaneVersionNotFoundError,
+)
+from .lane_invocations import LaneInvocationStore, LaneInvocationError
+from .routing_proposals import MainLLMRouter, MainLLMRouteResult, RoutingDispatcher, RoutingDispatchResult
+from .candidate_review import CandidateReviewError, CandidateReviewStore, review_payload
 
 
 class RuntimeConfigurationError(RuntimeError):
@@ -42,13 +54,19 @@ class Runtime:
         self.kernel = Kernel(self.storage)
         self.memory = MemoryStore(self.storage)
         self.models = ModelRegistry(self.storage)
+        self.lanes = LaneRegistry(self.storage)
+        self.lane_invocations = LaneInvocationStore(self.storage, self.lanes)
         self.secret_store = secret_store or SecretStore()
         self.providers = ProviderAdapters(self.secret_store)
         self.cognitive = CognitiveRuntime(self.storage, self.kernel, self.memory, self.models, self.providers)
+        self.lane_invocations.bind_cognitive_runtime(self.cognitive)
+        self.routing = MainLLMRouter(self.cognitive, self.lanes)
+        self.routing_dispatcher = RoutingDispatcher(self.storage, self.lanes, self.lane_invocations)
         self.conversations = ConversationStore(self.storage)
         self.syscalls = SyscallEngine(self.storage, self.kernel)
         self.core_apps = CoreApps(self.storage)
         self.connections = ConnectionStore(self.storage, artifact_store=ArtifactStore(self.home, self.storage))
+        self.candidate_reviews = CandidateReviewStore()
         self.bootstrap_token = secrets.token_urlsafe(32)
 
     def start(self) -> None:
@@ -129,11 +147,25 @@ class Runtime:
             raise RuntimeConfigurationError(result.response.error or "MODEL_INVOCATION_FAILED", "default model invocation failed")
         return result.output
 
+    def route_director_request(self, process_id: str, prompt: str, *, context_items: list[dict[str, str]] | None = None) -> MainLLMRouteResult:
+        """Classify a Director request only; execution remains a later phase."""
+        route = self.resolve_default_model_route()
+        return self.routing.route(process_id, prompt, context=context_items or [], route=route)
+
+    def dispatch_director_route(self, process_id: str, route_result: MainLLMRouteResult) -> RoutingDispatchResult:
+        """Materialize a previously validated Director route; does not execute cognition."""
+        return self.routing_dispatcher.dispatch(process_id, route_result)
+
+    def route_and_dispatch_director_request(self, process_id: str, prompt: str, *, context_items: list[dict[str, str]] | None = None) -> RoutingDispatchResult:
+        return self.dispatch_director_route(
+            process_id,
+            self.route_director_request(process_id, prompt, context_items=context_items),
+        )
+
 
 
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     instance = runtime or Runtime()
-
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         instance.start()
@@ -144,6 +176,34 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     app = FastAPI(title="Vesper", version="0.1.0", lifespan=lifespan)
     app.state.runtime = instance
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard_shell():
+        return HTMLResponse("""<!doctype html>
+<html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Vesper Dashboard</title></head>
+<body><main><h1>Vesper</h1><nav aria-label='Primary'><a href='/dashboard'>Today</a> <a href='/dashboard/lanes'>Lanes</a> <a href='/api/dashboard/today'>Dashboard API</a></nav><section id="today" aria-label="Today"><p>Local-first Director dashboard shell.</p></section></main></body></html>""")
+
+    @app.get("/dashboard/lanes", response_class=HTMLResponse)
+    def lane_dashboard_shell():
+        return HTMLResponse("""<!doctype html>
+<html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Vesper Lane Management</title></head>
+<body><main><h1>Lane Management</h1><nav aria-label='Primary'><a href='/dashboard'>Today</a> <a href='/dashboard/lanes'>Lanes</a></nav>
+<section id='lane-registry' aria-label='Lane registry'><p>Inspect versions, contracts, lifecycle, and candidate reviews.</p><form id='lane-registration'><label>Lane ID <input id='new-lane-id' required pattern='[A-Za-z0-9_\\-]+' /></label><label>Purpose <input id='new-lane-purpose' required /></label><button type='submit'>Register Lane</button><output id='registration-result' aria-live='polite'></output></form><button id='refresh-lanes' type='button'>Refresh lanes</button><div id='lanes' role='list'></div><pre id='lane-detail' aria-label='Lane detail'></pre><div id='lane-actions' aria-label='Lane lifecycle actions'><button id='enable-lane' type='button'>Enable</button><button id='disable-lane' type='button'>Disable</button><button id='retire-lane' type='button'>Retire</button><button id='supersede-lane' type='button'>Supersede</button><output id='lane-action-result' aria-live='polite'></output></div></section>
+<section id='candidate-reviews' aria-label='Candidate reviews'><h2>Candidate reviews</h2><div id='reviews' role='list'></div></section>
+<script>
+async function loadLanes(){const r=await fetch('/api/lanes'); const d=await r.json(); const lanes=d.lanes||[]; document.querySelector('#lanes').textContent=JSON.stringify(lanes); if(lanes[0]) await inspectLane(lanes[0].lane_id, lanes[0].version);}
+async function loadReviews(){const r=await fetch('/api/candidate-reviews'); const d=await r.json(); document.querySelector('#reviews').textContent=JSON.stringify(d.reviews||[]);}
+let selectedLane=null; let bootstrapToken='';
+async function registerLane(event){event.preventDefault(); const id=document.querySelector('#new-lane-id').value; const purpose=document.querySelector('#new-lane-purpose').value; const r=await fetch('/api/lanes',{method:'POST',headers:{'Content-Type':'application/json','X-Vesper-Bootstrap':bootstrapToken},body:JSON.stringify({lane_id:id,version:1,name:id,purpose,input_schema:{type:'object'},output_schema:{type:'object'}})}); document.querySelector('#registration-result').textContent=await r.text(); if(r.ok){event.target.reset(); await loadLanes();}}
+async function inspectLane(id,version){selectedLane={id,version}; const [contract,history]=await Promise.all([fetch(`/api/lanes/${encodeURIComponent(id)}/${version}/contract`).then(r=>r.json()),fetch(`/api/lanes/${encodeURIComponent(id)}/history`).then(r=>r.json())]); document.querySelector('#lane-detail').textContent=JSON.stringify({contract,history},null,2);}
+async function laneAction(path, body){if(!selectedLane){return;} const r=await fetch(`/api/lanes/${encodeURIComponent(selectedLane.id)}/${selectedLane.version}/${path}`,{method:'POST',headers:{'Content-Type':'application/json','X-Vesper-Bootstrap':window.vesperBootstrap||''},body:JSON.stringify(body||{})}); document.querySelector('#lane-action-result').textContent=await r.text(); await loadLanes();}
+for(const [id,path,body] of [['enable-lane','enabled',{enabled:true}],['disable-lane','enabled',{enabled:false}],['retire-lane','retire',{}]]) document.querySelector(`#${id}`).addEventListener('click',()=>laneAction(path,body));
+document.querySelector('#supersede-lane').addEventListener('click',()=>laneAction('supersede',{replacement_version:selectedLane ? selectedLane.version+1 : null}));
+document.querySelector('#lane-registration').addEventListener('submit',registerLane);
+document.querySelector('#refresh-lanes').addEventListener('click',()=>Promise.all([loadLanes(),loadReviews()]));
+fetch('/api/bootstrap').then(r=>r.json()).then(d=>{bootstrapToken=d.session; window.vesperBootstrap=d.session; return Promise.all([loadLanes(),loadReviews()]);});
+</script></main></body></html>""")
+
 
     @app.exception_handler(HTTPException)
     async def typed_http_exception(_: Request, exc: HTTPException):
@@ -166,7 +226,16 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if request.method not in {"GET", "HEAD", "OPTIONS"} and request.headers.get("x-vesper-bootstrap") != instance.bootstrap_token:
             return JSONResponse({"detail": "bootstrap session required"}, status_code=401)
         response = await call_next(request)
-        response.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self' http://127.0.0.1 http://localhost"
+        nonce = secrets.token_urlsafe(18)
+        if request.url.path in {"/dashboard", "/dashboard/lanes"} and response.headers.get("content-type", "").startswith("text/html"):
+            body = b""
+            async for chunk in response.body_iterator:
+                body += chunk
+            body = body.replace(b"<script>", f"<script nonce='{nonce}'>".encode("utf-8"))
+            headers = dict(response.headers)
+            headers.pop("content-length", None)
+            response = HTMLResponse(content=body, status_code=response.status_code, headers=headers, media_type="text/html")
+        response.headers["Content-Security-Policy"] = f"default-src 'self'; script-src 'nonce-{nonce}'; connect-src 'self' http://127.0.0.1 http://localhost"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
@@ -195,6 +264,120 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except KernelError as exc:
             raise kernel_error(exc) from exc
         return {"ok": True, "result": {"process_id": process.process_id, "process": process.__dict__}, "process": process.__dict__}
+
+    @app.get("/api/candidate-reviews")
+    def list_candidate_reviews():
+        return {"reviews": [review_payload(item) for item in instance.candidate_reviews._reviews.values()]}
+
+    @app.get("/api/lanes")
+    def list_lanes(lane_id: str | None = None):
+        return {"lanes": [item.__dict__ for item in instance.lanes.list(lane_id)]}
+
+    @app.post("/api/lanes")
+    async def register_lane(request: Request):
+        """Register a Lane through the authenticated local control boundary.
+
+        Registration is intentionally separate from activation: callers must
+        explicitly use the existing enabled lifecycle endpoint after review.
+        """
+        body = await request.json()
+        allowed = {
+            "lane_id", "version", "name", "purpose", "input_schema", "output_schema",
+            "context_policy", "tool_profile", "permission_ceiling",
+            "capability_requirements", "model_policy", "escalation_policy",
+            "stop_conditions", "evaluation_contract",
+        }
+        unknown = set(body) - allowed
+        if unknown:
+            raise HTTPException(status_code=422, detail={"error": {"code": "LANE_INVALID", "message": "unknown Lane fields"}})
+        try:
+            definition = LaneDefinition(
+                lane_id=str(body["lane_id"]), version=int(body["version"]),
+                name=str(body.get("name", body["lane_id"])), purpose=str(body["purpose"]),
+                input_schema=dict(body["input_schema"]), output_schema=dict(body["output_schema"]),
+                context_policy=dict(body.get("context_policy", {})), tool_profile=dict(body.get("tool_profile", {})),
+                permission_ceiling=dict(body.get("permission_ceiling", {})),
+                capability_requirements=dict(body.get("capability_requirements", {})),
+                model_policy=dict(body.get("model_policy", {})),
+                escalation_policy=dict(body.get("escalation_policy", {})),
+                stop_conditions=dict(body.get("stop_conditions", {})),
+                evaluation_contract=dict(body.get("evaluation_contract", {})), enabled=False,
+            )
+            lane = instance.lanes.register(definition)
+            return {"lane": lane.__dict__}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail={"error": {"code": "LANE_INVALID", "message": str(exc)}}) from exc
+        except LaneError as exc:
+            raise HTTPException(status_code=409, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+    @app.get("/api/lanes/{lane_id}/history")
+    def lane_history(lane_id: str):
+        return {"lanes": [item.__dict__ for item in instance.lanes.list(lane_id)]}
+
+    @app.get("/api/lanes/{lane_id}/{version}/contract")
+    def lane_contract(lane_id: str, version: int):
+        try:
+            lane = instance.lanes.get(lane_id, version)
+            return {"lane_id": lane.lane_id, "version": lane.version, "contract": {
+                "input_schema": lane.input_schema, "output_schema": lane.output_schema,
+                "context_policy": lane.context_policy, "tool_profile": lane.tool_profile,
+                "permission_ceiling": lane.permission_ceiling, "model_policy": lane.model_policy,
+                "evaluation_contract": lane.evaluation_contract,
+            }}
+        except LaneError as exc:
+            raise HTTPException(status_code=404, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+    @app.get("/api/lanes/{lane_id}/latest")
+    def latest_lane(lane_id: str):
+        try:
+            return {"lane": instance.lanes.latest(lane_id).__dict__}
+        except LaneError as exc:
+            raise HTTPException(status_code=404, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+    @app.get("/api/lanes/{lane_id}/{version}")
+    def get_lane(lane_id: str, version: int):
+        try:
+            return {"lane": instance.lanes.get(lane_id, version).__dict__}
+        except LaneError as exc:
+            raise HTTPException(status_code=404, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+    @app.post("/api/lanes/{lane_id}/{version}/enabled")
+    async def set_lane_enabled(lane_id: str, version: int, request: Request):
+        body = await request.json()
+        try:
+            lane = instance.lanes.set_enabled(lane_id, version, bool(body["enabled"]))
+            return {"lane": lane.__dict__}
+        except LaneError as exc:
+            raise HTTPException(status_code=404, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+    @app.post("/api/lanes/{lane_id}/{version}/retire")
+    def retire_lane(lane_id: str, version: int):
+        try:
+            return {"lane": instance.lanes.retire(lane_id, version).__dict__}
+        except LaneError as exc:
+            raise HTTPException(status_code=409, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+    @app.post("/api/lanes/{lane_id}/{version}/supersede")
+    async def supersede_lane(lane_id: str, version: int, request: Request):
+        body = await request.json()
+        try:
+            replacement = int(body["replacement_version"])
+            return {"lane": instance.lanes.supersede(lane_id, version, replacement).__dict__}
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="replacement_version is required") from exc
+        except LaneError as exc:
+            raise HTTPException(status_code=409, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+    @app.get("/api/lane-invocations/{invocation_id}")
+    def get_lane_invocation(invocation_id: str):
+        try:
+            return {"invocation": instance.lane_invocations.get(invocation_id).__dict__}
+        except LaneInvocationError as exc:
+            raise HTTPException(status_code=404, detail={"error": {"code": exc.code, "message": str(exc)}}) from exc
+
+    @app.get("/api/processes/{process_id}/lane-invocations")
+    def list_process_lane_invocations(process_id: str):
+        return {"invocations": [item.__dict__ for item in instance.lane_invocations.list(process_id)]}
 
     @app.get("/api/processes")
     def list_processes():
@@ -242,6 +425,48 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     def snapshot():
         return instance.kernel.snapshot()
 
+    @app.get("/api/dashboard/today")
+    def dashboard_today() -> dict[str, object]:
+        snapshot = instance.kernel.snapshot()
+        effects = instance.storage.write(lambda c: [dict(r) for r in c.execute("SELECT * FROM effects ORDER BY created_at, effect_id").fetchall()])
+        approvals = instance.storage.write(lambda c: [dict(r) for r in c.execute("SELECT * FROM approvals ORDER BY created_at, approval_id").fetchall()])
+        return {
+            "processes": snapshot.get("processes", []),
+            "lanes": [item.__dict__ for item in instance.lanes.list()],
+            "approvals": approvals,
+            "effects": effects,
+            "memory": {"available": True},
+            "observability": {
+                "process_count": len(snapshot.get("processes", [])),
+                "effect_count": len(effects),
+                "approval_count": len(approvals),
+                "event_cursor": snapshot.get("cursor", 0),
+                "verification": {"source": "kernel_snapshot", "status": "available"},
+            },
+        }
+
+    @app.get("/api/diagnostics/export")
+    def diagnostic_export() -> dict[str, object]:
+        snapshot = instance.kernel.snapshot()
+        events = instance.kernel.events_after(0).get("events", [])
+        return {
+            "processes": snapshot.get("processes", []),
+            "effects": instance.storage.write(lambda c: [dict(r) for r in c.execute("SELECT * FROM effects ORDER BY created_at, effect_id").fetchall()]),
+            "events": events,
+            "lanes": [item.__dict__ for item in instance.lanes.list()],
+            "recovery": {"cursor": snapshot.get("cursor", 0), "event_count": len(events)},
+        }
+
+    @app.post("/api/data/export")
+    async def safe_data_export(request: Request):
+        body = await request.json()
+        destination = Path(str(body.get("destination", ""))).expanduser()
+        if not destination.is_absolute():
+            raise HTTPException(status_code=422, detail={"code": "ABSOLUTE_DESTINATION_REQUIRED", "message": "destination must be absolute"})
+        if instance.connections.artifacts is None:
+            raise HTTPException(status_code=503, detail={"code": "ARTIFACT_STORE_UNAVAILABLE", "message": "artifact store is unavailable"})
+        return instance.connections.artifacts.safe_export(destination, artifact_ids=body.get("artifact_ids"))
+
     @app.get("/api/effects")
     def list_effects():
         def read(conn):
@@ -253,6 +478,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         body = await request.json()
         memory = instance.memory.put(kind=str(body["kind"]), payload=dict(body["payload"]), schema_id=str(body.get("schema_id", "memory")), scope_refs=tuple(body.get("scope_refs", [])), provenance=dict(body.get("provenance", {"source": "director"})), memory_id=body.get("memory_id"))
         return {"memory": instance.memory.to_dict(memory)}
+
+    @app.get("/api/memories")
+    def list_memories():
+        return {"memories": [instance.memory.to_dict(item) for item in instance.memory.latest()]}
 
     @app.get("/api/memories/{memory_id}")
     def get_memory(memory_id: str):

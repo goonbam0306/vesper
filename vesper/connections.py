@@ -132,9 +132,10 @@ class BrowserFallback:
 
 
 class ConnectionStore:
-    def __init__(self, storage: Storage, *, artifact_store: ArtifactStore | None = None):
+    def __init__(self, storage: Storage, *, artifact_store: ArtifactStore | None = None, secret_store: Any | None = None):
         self.storage = storage
         self.artifacts = artifact_store
+        self.secret_store = secret_store
         self.search_providers: dict[str, Callable[[str, float], list[dict[str, Any]]]] = {}
         self.metrics: dict[str, float | int] = {"search_latency_ms": 0.0, "search_failures": 0, "fetch_latency_ms": 0.0, "crawl_pages": 0, "crawl_bytes": 0, "capability_resolution_latency_ms": 0.0, "mcp_call_latency_ms": 0.0, "browser_fallback_usage": 0, "page_fault_count": 0, "warm_resume_count": 0}
 
@@ -394,6 +395,17 @@ class ConnectionStore:
 
     def list_secret_metadata(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self.storage.write(lambda c: c.execute("SELECT secret_ref,provider,label,backend,created_at FROM secret_metadata ORDER BY created_at DESC").fetchall())]
+
+    def rotate_secret(self, old_ref: str, value: str, *, label: str) -> str:
+        if not old_ref.startswith(("keychain://", "secret://", "env://")):
+            raise ConnectionError("INVALID_CREDENTIAL_REF", "credentials must be opaque SecretStore references")
+        if self.secret_store is None:
+            raise ConnectionError("SECRET_STORE_UNAVAILABLE", "secret rotation requires a secret store")
+        new_ref = self.secret_store.put(value, label=label)
+        self.storage.write(lambda c: c.execute("DELETE FROM secret_metadata WHERE secret_ref=?", (old_ref,)))
+        self.secret_store.delete(old_ref)
+        self.register_secret_metadata(provider="rotated", label=label, secret_ref=new_ref)
+        return new_ref
 
     def register_provider_connection(self, *, connection_id: str, display_name: str, base_url: str, api_style: str, credential_ref: str | None = None, headers_ref: str | None = None, endpoint_type: str = "custom", provider: str = "openai-compatible") -> dict[str, Any]:
         if api_style not in {"official", "openai-compatible", "local-compatible"}:

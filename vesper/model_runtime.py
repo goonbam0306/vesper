@@ -262,7 +262,10 @@ class CognitiveRuntime:
         process_id, need, route_id = row["process_id"], row["information_need"], row["route_id"]
         process = self.kernel.get(process_id)
         assert process is not None
-        outcome = self.memory.retrieve(need, process_id=process_id, authority=process.authority)
+        # Process residency is distinct from provenance filtering: page-fault
+        # recovery must retrieve facts available to the Process even when older
+        # memory objects predate process_id provenance metadata.
+        outcome = self.memory.retrieve(need, authority=process.authority)
         if outcome.status != RetrievalStatus.RESOLVED:
             unresolved = CognitiveAttempt(str(uuid.uuid4()), process_id, row["context_pack_id"], route_id, "UNRESOLVED", FailureClassification.RETRIEVAL_NEEDED, need, attempt_id)
             self._store_attempt(unresolved, {"model_route": route_id, "failure_classification": FailureClassification.RETRIEVAL_NEEDED, "retrieval_status": outcome.status})

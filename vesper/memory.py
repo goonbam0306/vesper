@@ -44,6 +44,21 @@ class Retrieval:
     query: str
 
 
+@dataclass(frozen=True)
+class ContextPack:
+    status: RetrievalStatus
+    items: tuple[MemoryObject, ...]
+    query: str
+    token_budget: int
+
+
+class WorkingSetState(StrEnum):
+    ACTIVE = "ACTIVE"
+    CHECKPOINTED = "CHECKPOINTED"
+    EVICTED = "EVICTED"
+    DISCARDED = "DISCARDED"
+
+
 class MemoryStore:
     def __init__(self, storage: Storage):
         self.storage = storage
@@ -78,6 +93,9 @@ class MemoryStore:
     def history(self, memory_id: str) -> list[MemoryObject]:
         return self.storage.write(lambda c: [self._row(row) for row in c.execute("SELECT * FROM memories WHERE memory_id=? ORDER BY revision", (memory_id,)).fetchall()])
 
+    def latest(self) -> list[MemoryObject]:
+        return self.storage.write(self._latest)
+
     def get(self, memory_id: str, revision: int | None = None) -> MemoryObject | None:
         def read(c: sqlite3.Connection) -> MemoryObject | None:
             if revision is None:
@@ -89,6 +107,31 @@ class MemoryStore:
 
     def page_in(self, process_id: str, memory: MemoryObject) -> None:
         self.storage.write(lambda c: c.execute("INSERT OR REPLACE INTO process_memory_working_set(process_id,memory_id,revision) VALUES(?,?,?)", (process_id, memory.memory_id, memory.revision)))
+
+    def checkpoint(self, process_id: str) -> tuple[MemoryObject, ...]:
+        """Durably mark the current L2 working set as checkpointed without deleting it."""
+        now = self._now()
+        self.storage.write(lambda c: c.execute("UPDATE process_memory_working_set SET lifecycle_state='CHECKPOINTED', checkpointed_at=? WHERE process_id=?", (now, process_id)))
+        return self.l2(process_id)
+
+    def evict(self, process_id: str, memory_id: str) -> MemoryObject | None:
+        """Remove one item from active L2 residency; the durable memory remains retrievable."""
+        item = self.get(memory_id)
+        self.storage.write(lambda c: c.execute("DELETE FROM process_memory_working_set WHERE process_id=? AND memory_id=?", (process_id, memory_id)))
+        return item
+
+    def discard(self, process_id: str) -> tuple[MemoryObject, ...]:
+        """Discard process-local residency only; this never deletes durable memory."""
+        items = self.l2(process_id)
+        self.storage.write(lambda c: c.execute("DELETE FROM process_memory_working_set WHERE process_id=?", (process_id,)))
+        return items
+
+    def promote(self, process_id: str, memory_id: str) -> MemoryObject | None:
+        """Promote an L2 item by returning its durable latest revision."""
+        item = self.get(memory_id)
+        if item is not None:
+            self.page_in(process_id, item)
+        return item
 
     def page_in_observation(self, process_id: str, evidence: dict[str, Any]) -> MemoryObject:
         """Create process-local, non-durable external evidence for one Context Pack resume."""
@@ -124,6 +167,8 @@ class MemoryStore:
         return lexical, semantic
 
     def retrieve(self, query: str, *, scope_refs: tuple[str, ...] = (), process_id: str | None = None,
+                 lane_id: str | None = None, artifact_type: str | None = None, artifact_id: str | None = None,
+                 artifact_producer: str | None = None, work_unit_id: str | None = None,
                  authority: tuple[str, ...] = (), limit: int = 10, relation_depth: int = 1, relation_limit: int = 10) -> Retrieval:
         terms = [term.lower() for term in query.split() if term]
         if not terms:
@@ -135,13 +180,27 @@ class MemoryStore:
             latest = self._latest(c)
             authorized = [obj for obj in latest if (not scope_refs or set(scope_refs).intersection(obj.scope_refs))]
             valid = [obj for obj in authorized if obj.validity == "VALID"]
+            filters = {
+                "process_id": process_id,
+                "lane_id": lane_id,
+                "artifact_type": artifact_type,
+                "artifact_id": artifact_id,
+                "artifact_producer": artifact_producer,
+                "work_unit_id": work_unit_id,
+            }
+            for key, expected in filters.items():
+                if expected is not None:
+                    valid = [obj for obj in valid if obj.provenance.get(key) == expected]
             stale = [obj for obj in authorized if obj.validity != "VALID"]
+            for key, expected in filters.items():
+                if expected is not None:
+                    stale = [obj for obj in stale if obj.provenance.get(key) == expected]
             scored: list[tuple[int, int, MemoryObject]] = []
             for obj in valid:
                 lexical, semantic = self._score(obj, terms)
                 if lexical or semantic:
                     scored.append((lexical, semantic, obj))
-            scored.sort(key=lambda item: (-item[0], -item[1], item[2].memory_id))
+            scored.sort(key=lambda item: (-item[0], -item[1], item[2].created_at, item[2].memory_id))
             if not scored:
                 stale_matches = [obj for obj in stale if any(score for score in self._score(obj, terms))]
                 return Retrieval(RetrievalStatus.STALE_ONLY if stale_matches else RetrievalStatus.NOT_FOUND, tuple(stale_matches[:limit]), query)
@@ -176,6 +235,72 @@ class MemoryStore:
             projected = tuple(replace(obj, provenance={**obj.provenance, "retrieval": {"lexical_semantic": self._score(obj, terms), "relation_depth": relation_depth}}) for obj in selected[:limit])
             return Retrieval(status, projected, query)
         return self.storage.write(read)
+
+    def admit_context_pack(self, query: str, *, token_budget: int, limit: int = 10, scope_refs: tuple[str, ...] = (), process_id: str | None = None, lane_id: str | None = None, artifact_type: str | None = None, artifact_id: str | None = None, artifact_producer: str | None = None, work_unit_id: str | None = None, authority: tuple[str, ...] = ()) -> ContextPack:
+        if token_budget < 1:
+            raise ValueError("token_budget must be positive")
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        retrieval = self.retrieve(
+            query,
+            scope_refs=scope_refs,
+            process_id=process_id,
+            lane_id=lane_id,
+            artifact_type=artifact_type,
+            artifact_id=artifact_id,
+            artifact_producer=artifact_producer,
+            work_unit_id=work_unit_id,
+            authority=authority,
+            limit=limit,
+        )
+        remaining = token_budget
+        selected: list[MemoryObject] = []
+        for item in retrieval.items:
+            encoded = json.dumps(item.payload, sort_keys=True, ensure_ascii=False)
+            cost = max(1, len(encoded.split()))
+            if cost > remaining:
+                continue
+            selected.append(item)
+            remaining -= cost
+        return ContextPack(retrieval.status, tuple(selected), query, token_budget)
+
+    def page_in_pack(self, process_id: str, pack: ContextPack) -> None:
+        if not isinstance(pack, ContextPack):
+            raise ValueError("ContextPack is required")
+        for item in pack.items:
+            self.page_in(process_id, item)
+
+    def archive(self, process_id: str) -> tuple[MemoryObject, ...]:
+        def op(conn: sqlite3.Connection) -> tuple[MemoryObject, ...]:
+            exists = conn.execute("SELECT 1 FROM processes WHERE process_id=?", (process_id,)).fetchone()
+            if not exists:
+                raise ValueError("process not found")
+            rows = conn.execute("SELECT m.* FROM process_memory_working_set w JOIN memories m ON m.memory_id=w.memory_id AND m.revision=w.revision WHERE w.process_id=?", (process_id,)).fetchall()
+            now = self._now()
+            for row in rows:
+                conn.execute("UPDATE memories SET validity='ARCHIVED',updated_at=? WHERE memory_id=? AND revision=?", (now, row["memory_id"], row["revision"]))
+            conn.execute("DELETE FROM process_memory_working_set WHERE process_id=?", (process_id,))
+            return tuple(self._row(row) for row in rows)
+        return self.storage.write(op)
+
+    def compress(self, source_memory_ids: tuple[str, ...], *, summary: str) -> MemoryObject:
+        if not source_memory_ids:
+            raise ValueError("source memories are required")
+        if not summary.strip():
+            raise ValueError("summary is required")
+        def op(conn: sqlite3.Connection) -> MemoryObject:
+            placeholders = ",".join("?" for _ in source_memory_ids)
+            rows = conn.execute(f"SELECT * FROM memories WHERE memory_id IN ({placeholders}) AND revision IN (SELECT MAX(revision) FROM memories GROUP BY memory_id)", source_memory_ids).fetchall()
+            if len(rows) != len(set(source_memory_ids)):
+                raise ValueError("source memory not found")
+            now = self._now()
+            for row in rows:
+                conn.execute("UPDATE memories SET validity='ARCHIVED',updated_at=? WHERE memory_id=? AND revision=?", (now, row["memory_id"], row["revision"]))
+            mid = str(uuid.uuid4())
+            provenance = {"source": "compression", "compression": {"source_memory_ids": list(source_memory_ids)}}
+            conn.execute("INSERT INTO memories VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (mid, 1, "summary", "memory_summary", 1, "[]", json.dumps({"text": summary}, sort_keys=True), json.dumps(provenance, sort_keys=True), "DERIVED", "VALID", None, now, now))
+            return self._row(conn.execute("SELECT * FROM memories WHERE memory_id=? AND revision=1", (mid,)).fetchone())
+        return self.storage.write(op)
 
     def to_dict(self, obj: MemoryObject) -> dict[str, Any]:
         return asdict(obj)

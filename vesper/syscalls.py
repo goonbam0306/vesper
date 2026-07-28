@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -12,6 +13,7 @@ from typing import Any, Callable
 
 from .kernel import Kernel, ProcessStatus, WaitReason
 from .storage import Storage
+from .approved_file_apply import ApprovedFileApply, FileApplyApproval, PatchOperation, PatchSet
 
 
 class Decision(StrEnum):
@@ -122,13 +124,38 @@ class SyscallResult:
 
 
 class SyscallEngine:
-    def __init__(self, storage: Storage, kernel: Kernel):
+    def __init__(self, storage: Storage, kernel: Kernel, *, repository_root=None):
         self.storage = storage
         self.kernel = kernel
-        self.primitives: dict[str, Callable[[SyscallRequest], dict[str, Any]]] = {
+        self.primitives: dict[str, Callable[..., dict[str, Any]]] = {
             "test.echo": lambda request: {"message": request.args["message"]},
             "test.effect": lambda request: {"value": request.args["value"], "effect": "committed"},
         }
+        if repository_root is not None:
+            applier = ApprovedFileApply(repository_root)
+
+            def apply_files(request: SyscallRequest) -> dict[str, Any]:
+                args = request.args
+                patch_set = PatchSet(
+                    patch_id=str(args["patch_id"]),
+                    repository_root=applier.repository_root,
+                    operations=tuple(PatchOperation(**operation) for operation in args["operations"]),
+                )
+                approval_id = None
+                if not approval_id:
+                    raise ApprovalRequired("approved_file_apply approval identity")
+                result = applier.apply(
+                    patch_set,
+                    approval=FileApplyApproval(
+                        approval_id=approval_id,
+                        director_id=request.actor,
+                        patch_id=patch_set.patch_id,
+                        repository_root=applier.repository_root,
+                    ),
+                )
+                return {"patch_id": result.patch_id, "approval_id": result.approval_id, "changed_paths": list(result.changed_paths)}
+
+            self.primitives["approved_file_apply"] = apply_files
 
     @staticmethod
     def _now() -> str:
@@ -382,10 +409,24 @@ class SyscallEngine:
 
         _, effect_id = self.storage.write(reserve)
         try:
+            if approval_id:
+                object.__setattr__(request, "_approval_id", approval_id)
             primitive = self.primitives.get(request.operation)
             if primitive is None:
                 raise NotRegistered(request.operation)
-            output = primitive(request)
+            if request.operation == "approved_file_apply":
+                args = request.args
+                patch_set = PatchSet(
+                    patch_id=str(args["patch_id"]),
+                    repository_root=Path(args["repository_root"]).resolve(),
+                    operations=tuple(PatchOperation(**operation) for operation in args["operations"]),
+                )
+                applier = ApprovedFileApply(patch_set.repository_root)
+                approval = FileApplyApproval(approval_id or "", request.actor, patch_set.patch_id, patch_set.repository_root)
+                applied = applier.apply(patch_set, approval=approval)
+                output = {"patch_id": applied.patch_id, "approval_id": applied.approval_id, "changed_paths": list(applied.changed_paths)}
+            else:
+                output = primitive(request)
         except TimeoutError:
             if effect_id:
                 self.storage.write(lambda c: c.execute(

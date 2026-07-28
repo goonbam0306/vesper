@@ -199,6 +199,9 @@ class Storage:
 
     def _writer_loop(self) -> None:
         connection = self.connect()
+        # The writer connection must not wait inside sqlite; the retry loop below
+        # owns backoff and metrics for every lock conflict.
+        connection.execute("PRAGMA busy_timeout = 0")
         try:
             while True:
                 item = self._queue.get()

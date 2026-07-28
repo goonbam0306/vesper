@@ -502,6 +502,18 @@ class Kernel:
                 continue
         return recovered
 
+    def recover_running_processes(self) -> tuple[str, ...]:
+        """Reconcile in-flight processes after a crash without claiming completion."""
+        ids = self.storage.write(lambda conn: tuple(row["process_id"] for row in conn.execute("SELECT process_id FROM processes WHERE status=? ORDER BY process_id", (ProcessStatus.RUNNING,)).fetchall()))
+        recovered: list[str] = []
+        for process_id in ids:
+            try:
+                self.transition(process_id, ProcessStatus.PAUSED)
+                recovered.append(process_id)
+            except (InvalidTransition, ProcessNotFound):
+                continue
+        return tuple(recovered)
+
     def snapshot(self) -> dict[str, Any]:
         def read(conn: sqlite3.Connection) -> dict[str, Any]:
             rows = conn.execute("SELECT p.*, a.authority_json, a.delegable_authority_json FROM processes p LEFT JOIN process_authority a USING(process_id) ORDER BY p.created_at").fetchall()
