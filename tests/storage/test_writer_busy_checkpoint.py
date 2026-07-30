@@ -29,10 +29,11 @@ def test_checkpoint_records_actual_duration_and_result(tmp_path: Path):
 def test_busy_lock_is_retried_then_commit_succeeds(tmp_path: Path):
     db = tmp_path / "busy-success.sqlite3"
     storage = Storage(db, busy_retry_limit=4, busy_backoff_ms=5)
-    storage.migrate(); storage.start()
+    storage.migrate()
     lock = sqlite3.connect(db, timeout=0, check_same_thread=False)
     lock.execute("PRAGMA foreign_keys = ON")
     lock.execute("BEGIN IMMEDIATE")
+    storage.start()
     finished = threading.Event()
     try:
         def release() -> None:
@@ -59,11 +60,11 @@ def test_busy_lock_is_retried_then_commit_succeeds(tmp_path: Path):
 def test_busy_lock_terminates_at_bounded_retry_limit_without_commit(tmp_path: Path):
     db = tmp_path / "busy-fail.sqlite3"
     storage = Storage(db, busy_retry_limit=2, busy_backoff_ms=2)
-    storage.migrate(); storage.start()
-    storage.write(lambda conn: conn.execute("SELECT 1"))
+    storage.migrate()
     lock = sqlite3.connect(db, timeout=0, check_same_thread=False)
     lock.execute("PRAGMA foreign_keys = ON")
     lock.execute("BEGIN IMMEDIATE")
+    storage.start()
     started = time.perf_counter()
     try:
         with pytest.raises(StorageBusyError) as error:
