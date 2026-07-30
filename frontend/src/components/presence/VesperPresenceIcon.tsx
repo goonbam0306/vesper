@@ -1,4 +1,4 @@
-import type { SVGProps } from 'react'
+import { useEffect, useState, type SVGProps } from 'react'
 import { presenceLabel, type VesperPresenceSize, type VesperPresenceState } from './presence-state'
 
 export interface VesperPresenceIconProps {
@@ -11,6 +11,14 @@ export interface VesperPresenceIconProps {
 }
 
 export function VesperPresenceIcon({ state, size = 24, label, decorative = false, className = '', testId }: VesperPresenceIconProps) {
+  const [reducedMotion, setReducedMotion] = useState(false)
+  useEffect(() => {
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const update = () => setReducedMotion(query.matches)
+    update()
+    query.addEventListener('change', update)
+    return () => query.removeEventListener('change', update)
+  }, [])
   const semantics: SVGProps<SVGSVGElement> = decorative
     ? { 'aria-hidden': true }
     : { role: 'img', 'aria-label': presenceLabel(state, label) }
@@ -18,6 +26,9 @@ export function VesperPresenceIcon({ state, size = 24, label, decorative = false
     {...semantics}
     data-testid={testId}
     data-presence-state={state}
+    data-size={size}
+    data-reduced-motion={reducedMotion || undefined}
+    data-blocked-topology={state === 'blocked' ? 'sealed' : undefined}
     className={`vesper-presence-icon size-${size} is-${state} ${className}`.trim()}
     width={size}
     height={size}

@@ -19,7 +19,8 @@ export const askPresenceState = (state: 'idle' | 'sending' | 'response' | 'failu
 }
 
 export const processPresenceState = (status: string): VesperPresenceState => {
+  if (status === 'RUNNING') return 'thinking'
   if (status === 'WAITING' || status === 'PAUSED') return 'waiting'
-  if (status === 'FAILED' || status === 'CANCELLED') return 'blocked'
+  if (status === 'FAILED') return 'blocked'
   return 'idle'
 }
