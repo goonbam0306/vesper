@@ -20,13 +20,13 @@ Status is based on executable repository evidence, not prior Phase labels. `last
 | D-02 | BLOCKED | adapter implementation | real authenticated read gate | — | Requires external credentials and designated service scope. |
 | D-03 | BLOCKED | adapter implementation | approval-gated sandbox write gate | — | Requires Director approval and designated reversible sandbox target. |
 | D-04 | IN PROGRESS | adapter/recovery modules | provider failure/ambiguous write gate | — | Local boundaries exist; real adapter recovery remains dependent on D-02/D-03. |
-| E-01 | IMPLEMENTED WITH EVIDENCE | `frontend/e2e/e01-repeated-director-workflow.spec.ts`, `frontend/e2e/support/vesper-harness.ts` | `cd frontend && VESPER_E2E_PYTHON=../.venv/bin/python npm run e2e -- --grep 'E-01'` → 1 passed; full local E2E → 22 passed; CI run `30522293358` → success | `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c` | Browser-level Director workflow captures an idea, traverses all applicable V1 surfaces, persists settings, restarts backend/frontend against the same durable home, verifies continuity, and completes a second interaction cycle. |
+| E-01 | IMPLEMENTED WITH EVIDENCE | `frontend/e2e/e01-repeated-director-workflow.spec.ts`, `frontend/e2e/support/vesper-harness.ts` | `cd frontend && VESPER_E2E_PYTHON=../.venv/bin/python npm run e2e -- --grep 'E-01'` → 1 passed; full local E2E → 22 passed; CI run `30522725076` → success | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | Browser-level Director workflow captures an idea, traverses all applicable V1 surfaces, persists settings, restarts backend/frontend against the same durable home, verifies continuity, and completes a second interaction cycle. |
 | E-02 | BLOCKED | frontend + adapter | external observation dashboard gate | — | Depends on D-track adapter availability. |
-| E-03 | IMPLEMENTED WITH EVIDENCE | `frontend/e2e/e03-product-error-matrix.spec.ts` | `cd frontend && VESPER_E2E_PYTHON=../.venv/bin/python npm run e2e -- --grep 'E-03'` → 3 passed; full local E2E → 22 passed; CI run `30522293358` → success | `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c` | Executable browser coverage verifies the full applicable product error-state matrix: no-model/no-data, approvals/process empty states, offline connections, stale memory, and disabled/retired Lane messaging without false success. |
-| F-01 | VERIFIED — REMOTE CI GREEN | `.github/workflows/vesper-ci.yml` | GitHub Actions run `30522293358` / job `90805210693` → success; all compile, migration/bootstrap, backend pytest, frontend build, Playwright, diff, and documentation steps passed | `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c` | [Run](https://github.com/goonbam0306/vesper/actions/runs/30522293358) |
-| F-02 | VERIFIED — COMMIT/PUSH/CI EVIDENCE | `docs/VESPER_V1_CLOSURE_STATUS.md`, `docs/VESPER_V1_CLOSURE_SPEC.md` | `git push origin main` → `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c`; remote run `30522293358` → success | `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c` | Exact closure status tree is pushed to `goonbam0306/vesper:main` and verified by CI. |
+| E-03 | IMPLEMENTED WITH EVIDENCE | `frontend/e2e/e03-product-error-matrix.spec.ts` | `cd frontend && VESPER_E2E_PYTHON=../.venv/bin/python npm run e2e -- --grep 'E-03'` → 3 passed; full local E2E → 22 passed; CI run `30522725076` → success | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | Executable browser coverage verifies the full applicable product error-state matrix: no-model/no-data, approvals/process empty states, offline connections, stale memory, and disabled/retired Lane messaging without false success. |
+| F-01 | VERIFIED — REMOTE CI GREEN | `.github/workflows/vesper-ci.yml` | GitHub Actions run `30522725076` / job `90806552379` → success; all compile, migration/bootstrap, backend pytest, frontend build, Playwright, diff, and documentation steps passed | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | [Run](https://github.com/goonbam0306/vesper/actions/runs/30522725076) |
+| F-02 | VERIFIED — COMMIT/PUSH/CI EVIDENCE | `docs/VESPER_V1_CLOSURE_STATUS.md`, `docs/VESPER_V1_CLOSURE_SPEC.md` | `git push origin main` → `66d8b9937b510bcdb290e4ee8ea867dbec5559bf`; remote run `30522725076` → success | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | Exact closure status tree is pushed to `goonbam0306/vesper:main` and verified by CI. |
 | F-03 | IMPLEMENTED WITH EVIDENCE | `README.md`, `docs/VESPER_V1_CLOSURE_STATUS.md` | README contains authoritative spec/status links and explicit NOT SEALED conclusion | working tree | Historical phase claims are no longer presented as current seal evidence. |
-| Seal | NOT SEALED | repository-wide | final audit: local full gates passed; CI run `30522293358` success; unresolved applicable rows remain | `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c` | V1 cannot be sealed while C-02 is decision-required and D-01/D-04 remain in progress; E-02 remains externally blocked on D-track availability. |
+| Seal | NOT SEALED | repository-wide | final audit: local full gates passed; CI run `30522725076` success; unresolved applicable rows remain | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | V1 cannot be sealed while C-02 is decision-required and D-01/D-04 remain in progress; E-02 remains externally blocked on D-track availability. |
 
 ## Evidence policy
 
@@ -40,13 +40,13 @@ Each row must cite exact commands, commit SHA, exit status, and (for CI) workflo
 
 ## Current conclusion
 
-`VESPER V1 NOT SEALED` — E-01 and E-03 local closure gates are implemented with executable browser evidence, and the complete local/remote repository gates are green at commit `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c`. Seal is still withheld because the following applicable items remain unresolved:
+`VESPER V1 NOT SEALED` — E-01 and E-03 local closure gates are implemented with executable browser evidence, and the complete local/remote repository gates are green at commit `66d8b9937b510bcdb290e4ee8ea867dbec5559bf`. Seal is still withheld because the following applicable items remain unresolved:
 
 - C-02: Director must select local encryption policy A, B, or C.
 - D-01/D-04: local adapter boundary/recovery audit remains incomplete; D-02/D-03 remain blocked only on external credentials, designated scope, sandbox, and approval.
 - E-02: remains blocked on D-track external observation availability.
-- F-01/F-02 are verified: commit `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c`, CI run `30522293358` successful.
+- F-01/F-02 are verified: commit `66d8b9937b510bcdb290e4ee8ea867dbec5559bf`, CI run `30522725076` successful.
 
 These are not silently treated as complete or as approved deferrals.
 
-Last updated: 2026-07-30 (commit `e2d7c748fab6e1ebcdcdb87b7ccc6c77550d822c`; CI run `30522293358`)
+Last updated: 2026-07-30 (commit `66d8b9937b510bcdb290e4ee8ea867dbec5559bf`; CI run `30522725076`)
