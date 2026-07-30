@@ -32,8 +32,7 @@ def test_busy_lock_is_retried_then_commit_succeeds(tmp_path: Path):
     storage.migrate(); storage.start()
     lock = sqlite3.connect(db, timeout=0, check_same_thread=False)
     lock.execute("PRAGMA foreign_keys = ON")
-    lock.execute("PRAGMA journal_mode = WAL")
-    lock.execute("BEGIN EXCLUSIVE")
+    lock.execute("BEGIN IMMEDIATE")
     finished = threading.Event()
     try:
         def release() -> None:
@@ -64,8 +63,7 @@ def test_busy_lock_terminates_at_bounded_retry_limit_without_commit(tmp_path: Pa
     storage.write(lambda conn: conn.execute("SELECT 1"))
     lock = sqlite3.connect(db, timeout=0, check_same_thread=False)
     lock.execute("PRAGMA foreign_keys = ON")
-    lock.execute("PRAGMA journal_mode = WAL")
-    lock.execute("BEGIN EXCLUSIVE")
+    lock.execute("BEGIN IMMEDIATE")
     started = time.perf_counter()
     try:
         with pytest.raises(StorageBusyError) as error:
@@ -108,8 +106,7 @@ def test_real_sqlite_contention_path_is_exercised(tmp_path: Path):
     # Ensure the writer has opened its WAL connection before another connection takes the lock.
     storage.write(lambda conn: conn.execute("SELECT 1"))
     lock = sqlite3.connect(db, timeout=0, check_same_thread=False)
-    lock.execute("PRAGMA journal_mode = WAL")
-    lock.execute("BEGIN EXCLUSIVE")
+    lock.execute("BEGIN IMMEDIATE")
     try:
         with pytest.raises(StorageBusyError):
             storage.write(lambda conn: conn.execute(
