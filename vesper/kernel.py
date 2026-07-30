@@ -190,12 +190,23 @@ class Kernel:
         self._volatile_waits: dict[str, tuple[WaitReason, str]] = {}
         self._handlers: dict[str, Any] = {}
         self.scheduler = ProcessScheduler()
+        self._startup_reconciliation: dict[str, tuple[str, ...]] | None = None
 
     def register_handler(self, process_id: str, handler: Any) -> None:
+        """Register a one-shot executor for an already-created process."""
         self._handlers[process_id] = handler
+
+    def register_origin_handler(self, origin: str, handler: Any) -> None:
+        """Register the durable executor used for new and recurring processes."""
+        if not hasattr(self, "_origin_handlers"):
+            self._origin_handlers: dict[str, Any] = {}
+        self._origin_handlers[origin] = handler
 
     def _execute_scheduled(self, process_id: str) -> None:
         handler = self._handlers.pop(process_id, None)
+        process = self.get(process_id)
+        if handler is None and process is not None:
+            handler = getattr(self, "_origin_handlers", {}).get(process.origin)
         if handler is None:
             return
         try:
@@ -484,15 +495,41 @@ class Kernel:
         return self.storage.write(op)
 
     def reconcile_startup(self) -> dict[str, tuple[str, ...]]:
-        """Run the complete conservative startup reconciliation pass.
+        """Conservatively reconcile every Kernel-owned recoverable state.
 
-        Terminal intents are authoritative and are applied first. Remaining
-        RUNNING work is uncertain after a stop/crash, so it is paused and
-        surfaced for explicit retry instead of being marked complete.
+        Durable terminal results are authoritative. Any other in-flight work is
+        uncertain and is paused, never completed by inference. Graph nodes,
+        waits, approvals, effects, timers, recurrence, monitoring, and policy
+        rows are inspected in the same transaction boundary and reported so the
+        next scheduler pass can resume only explicitly eligible work.
         """
         terminal = tuple(process.process_id for process in self.recover_terminal_intents())
         paused = self.recover_running_processes()
-        return {"terminal_intents": terminal, "paused_uncertain": paused}
+        def inspect(conn: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
+            def ids(sql: str, args: tuple[Any, ...] = ()) -> tuple[str, ...]:
+                return tuple(row[0] for row in conn.execute(sql, args).fetchall())
+            # A claimed timer whose process was not resumed is made available
+            # again; the claim is a delivery lease, not completion evidence.
+            if paused:
+                placeholders = ",".join("?" for _ in paused)
+                conn.execute(f"UPDATE process_timers SET claimed_at=NULL WHERE process_id IN ({placeholders}) AND process_id NOT IN (SELECT process_id FROM process_results)", paused)
+            return {
+                "terminal_intents": terminal,
+                "paused_uncertain": paused,
+                "running_graph_nodes": ids("SELECT DISTINCT graph_id || ':' || node_id FROM execution_graph_nodes WHERE status='RUNNING'"),
+                "open_waits": ids("SELECT graph_id || ':' || node_id FROM execution_graph_waits WHERE resumed=0"),
+                "claimed_timers_released": ids("SELECT process_id FROM process_timers WHERE claimed_at IS NULL AND process_id IN (SELECT process_id FROM processes WHERE status='PAUSED')"),
+                "recurring_processes": ids("SELECT process_id FROM process_recurrences WHERE run_count < max_runs"),
+                "monitoring_processes": ids("SELECT process_id FROM process_policies WHERE policy_class='monitoring'"),
+                "pending_approvals": ids("SELECT approval_id FROM approvals WHERE decision='PENDING'"),
+                "unreconciled_effects": ids("SELECT effect_id FROM effects WHERE status IN ('RESERVED','UNKNOWN_EFFECT')"),
+                "policy_runtime_state": ids("SELECT process_id FROM process_runtime_state"),
+            }
+        report = self.storage.write(inspect)
+        return report
+
+    def last_startup_reconciliation(self) -> dict[str, tuple[str, ...]] | None:
+        return getattr(self, "_startup_reconciliation", None)
 
     def recover_terminal_intents(self) -> list[Process]:
         """Converge RUNNING processes with an already durable generic result.
@@ -542,33 +579,63 @@ class Kernel:
         return self.storage.write(read)
 
     def reconcile_scheduled_work(self, *, now: Any) -> dict[str, tuple[str, ...]]:
-        """Claim due durable wake work and enqueue it through the Kernel scheduler."""
-        from .process_policy import ProcessRecurrenceStore, ProcessTimerStore
+        """Claim due work and route it through the normal Kernel scheduler.
 
-        timers = ProcessTimerStore(self.storage)
+        Recurrence consumption is deliberately part of the Kernel-owned claim
+        operation.  It is not an application/test helper call followed by an
+        unrelated enqueue: one durable write claims the run and advances its
+        policy cursor, after which the process is enqueued for the same
+        scheduler/executor path as ordinary work.
+        """
+        from datetime import datetime, timezone, timedelta
+
+        now_value = now.isoformat() if hasattr(now, "isoformat") else str(now)
         claimed_timers: list[str] = []
-        for process_id, wake_key in timers.due(now=now):
-            if timers.claim(process_id):
-                self.wake(wake_key)
-                claimed_timers.append(process_id)
-
-        recurrence = ProcessRecurrenceStore(self.storage)
-        recurrence_ids = self.storage.write(
-            lambda conn: tuple(
-                row["process_id"] for row in conn.execute(
-                    "SELECT process_id FROM process_recurrences "
-                    "WHERE run_count < max_runs AND next_due_at IS NOT NULL AND next_due_at <= ? "
-                    "ORDER BY next_due_at, process_id", (now.isoformat() if hasattr(now, "isoformat") else str(now),)
-                ).fetchall()
-            )
-        )
         scheduled_recurrence: list[str] = []
+
+        def claim_due(conn: sqlite3.Connection) -> tuple[list[tuple[str, str]], list[str]]:
+            timer_rows = conn.execute(
+                "SELECT process_id,wake_key FROM process_timers "
+                "WHERE claimed_at IS NULL AND due_at<=? ORDER BY due_at,process_id", (now_value,)
+            ).fetchall()
+            timer_claims: list[tuple[str, str]] = []
+            for row in timer_rows:
+                claimed = conn.execute(
+                    "UPDATE process_timers SET claimed_at=? WHERE process_id=? AND claimed_at IS NULL",
+                    (self._now(), row["process_id"]),
+                )
+                if claimed.rowcount == 1:
+                    timer_claims.append((row["process_id"], row["wake_key"]))
+
+            recurrence_ids: list[str] = []
+            rows = conn.execute(
+                "SELECT r.process_id,r.interval_seconds,r.run_count,r.max_runs,p.status "
+                "FROM process_recurrences r JOIN processes p USING(process_id) "
+                "WHERE r.run_count<r.max_runs AND r.next_due_at IS NOT NULL "
+                "AND r.next_due_at<=? AND p.status IN (?,?) "
+                "ORDER BY r.next_due_at,r.process_id", (now_value, ProcessStatus.CREATED, ProcessStatus.PAUSED),
+            ).fetchall()
+            for row in rows:
+                next_due = (datetime.fromisoformat(now_value) + timedelta(seconds=int(row["interval_seconds"]))).isoformat()
+                updated = conn.execute(
+                    "UPDATE process_recurrences SET run_count=run_count+1,next_due_at=? "
+                    "WHERE process_id=? AND run_count=? AND run_count<max_runs",
+                    (next_due, row["process_id"], row["run_count"]),
+                )
+                if updated.rowcount == 1:
+                    recurrence_ids.append(row["process_id"])
+            return timer_claims, recurrence_ids
+
+        timer_claims, recurrence_ids = self.storage.write(claim_due)
+        for process_id, wake_key in timer_claims:
+            resumed = self.wake(wake_key)
+            if any(process.process_id == process_id for process in resumed):
+                claimed_timers.append(process_id)
         for process_id in recurrence_ids:
-            if recurrence.next_run(process_id, now=now.isoformat() if hasattr(now, "isoformat") else str(now)) is not None:
-                process = self.get(process_id)
-                if process and ProcessStatus(process.status) in {ProcessStatus.CREATED, ProcessStatus.PAUSED}:
-                    self.scheduler.enqueue(process_id, self._priority(process.priority))
-                    scheduled_recurrence.append(process_id)
+            process = self.get(process_id)
+            if process:
+                self.scheduler.enqueue(process_id, self._priority(process.priority))
+                scheduled_recurrence.append(process_id)
         return {"timers": tuple(claimed_timers), "recurrence": tuple(scheduled_recurrence)}
 
     def run_scheduler(self, *, max_slices: int = 1, now: Any | None = None) -> list[Process]:
@@ -580,10 +647,12 @@ class Kernel:
             if not item:
                 break
             process = self.get(item.process_id)
-            if process is None or ProcessStatus(process.status) != ProcessStatus.CREATED:
+            if process is None or ProcessStatus(process.status) not in {ProcessStatus.CREATED, ProcessStatus.PAUSED, ProcessStatus.RUNNING}:
                 continue
             try:
-                ran.append(self.transition(item.process_id, ProcessStatus.RUNNING))
+                if ProcessStatus(process.status) in {ProcessStatus.CREATED, ProcessStatus.PAUSED}:
+                    process = self.transition(item.process_id, ProcessStatus.RUNNING)
+                ran.append(process)
                 self._execute_scheduled(item.process_id)
             except InvalidTransition:
                 continue

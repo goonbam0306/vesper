@@ -79,7 +79,8 @@ class Runtime:
         """
         self.storage.migrate()
         self.storage.start()
-        self.kernel.reconcile_startup()
+        self.startup_reconciliation = self.kernel.reconcile_startup()
+        self.kernel._startup_reconciliation = self.startup_reconciliation
 
     def stop(self) -> None:
         self.storage.stop()

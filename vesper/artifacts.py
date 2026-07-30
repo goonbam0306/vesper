@@ -200,6 +200,53 @@ class ArtifactStore:
         self._fsync_directory(destination)
         return manifest
 
+    def safe_reset(
+        self,
+        *,
+        principal: str,
+        scope: list[str],
+        export_destination: Path | None = None,
+        export_before_reset: bool = False,
+    ) -> dict[str, object]:
+        """Reset only explicitly selected artifact state after Director authorization.
+
+        Runtime databases, credential stores, migrations, and system files are
+        outside the reset boundary by construction. The receipt is canonical
+        and deterministic for the selected scope; repeated calls are idempotent.
+        """
+        if principal.strip().lower() not in {"director", "bootstrap"}:
+            raise ArtifactValidationError("safe reset requires Director/bootstrap authorization")
+        if not isinstance(scope, list) or not scope or any(not isinstance(item, str) or not item.strip() for item in scope):
+            raise ArtifactValidationError("reset scope must be a non-empty list")
+        protected = {"runtime", "system", "credentials", "secrets", "migrations", "database"}
+        if any(item.lower() in protected for item in scope):
+            raise ArtifactValidationError("protected runtime/system state is outside the reset boundary")
+        artifact_ids = sorted(set(scope))
+        rows = self.storage.connect().execute(
+            "SELECT artifact_id, sha256, path FROM artifacts WHERE artifact_id IN (%s)" % ",".join("?" for _ in artifact_ids),
+            artifact_ids,
+        ).fetchall()
+        found = {row["artifact_id"] for row in rows}
+        if found != set(artifact_ids):
+            raise ArtifactValidationError("reset scope contains an unknown artifact")
+        export_manifest = None
+        if export_before_reset:
+            if export_destination is None:
+                raise ArtifactValidationError("export destination is required before reset")
+            export_manifest = self.safe_export(export_destination, artifact_ids=artifact_ids)
+        reset_key = hashlib.sha256(("|".join(artifact_ids)).encode()).hexdigest()
+        deleted_at = datetime.now(timezone.utc).isoformat()
+        def delete(conn):
+            conn.executemany("DELETE FROM artifacts WHERE artifact_id=?", [(item,) for item in artifact_ids])
+            conn.execute(
+                "INSERT OR REPLACE INTO safe_reset_receipts(reset_key, principal, scope_json, export_id, deleted_at) VALUES (?,?,?,?,?)",
+                (reset_key, principal, json.dumps(artifact_ids), (export_manifest or {}).get("export_id"), deleted_at),
+            )
+        self.storage.write(delete)
+        for row in rows:
+            Path(row["path"]).unlink(missing_ok=True)
+        return {"reset_key": reset_key, "principal": principal, "scope": artifact_ids, "export": export_manifest, "deleted_at": deleted_at}
+
     def _content_files(self):
         return (p for p in self.content_root.glob("??/*") if p.is_file())
 

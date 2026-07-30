@@ -126,15 +126,35 @@ class CandidateReviewStore:
         if current.activated:
             return current
         updated = CandidateReview(current.candidate, current.reviewer, current.evidence, current.decision, current.note, current.approval_id, current.decided_at, True)
-        self._persist(updated)
-        if self.storage is not None:
-            self.storage.write(lambda conn: conn.execute(
-                """INSERT INTO candidate_activation_audit
-                (audit_id, candidate_key, approval_id, actor, activated_at)
-                VALUES (?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), self._key(candidate), approval_id, current.reviewer,
-                 datetime.now(timezone.utc).isoformat()),
-            ))
+        if self.storage is None:
+            self._reviews[current.candidate.supporting_fallback_ids] = updated
+            return updated
+
+        # The review flag, deterministic registry transaction, and immutable
+        # receipt share one SQLite writer transaction. No activated-only state
+        # can survive an activation failure.
+        def operation(conn):
+            row = conn.execute(
+                "SELECT decision, approval_id, activated FROM candidate_reviews WHERE candidate_key=?",
+                (self._key(candidate),),
+            ).fetchone()
+            if row is None or row["decision"] != "APPROVED" or row["approval_id"] != approval_id:
+                raise CandidateReviewError("candidate requires a matching durable approval")
+            if row["activated"]:
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            candidate_key = self._key(candidate)
+            activation_key = sha256(f"{candidate_key}|{approval_id}|{candidate.recommended_abstraction}".encode()).hexdigest()
+            conn.execute(
+                "INSERT OR IGNORE INTO abstraction_activation_registry (activation_key,candidate_key,abstraction_kind,canonical_function,enabled,activated_at) VALUES (?,?,?,?,?,?)",
+                (activation_key, candidate_key, candidate.recommended_abstraction, candidate.canonical_function, int(candidate.recommended_abstraction != "NEW_LANE"), now),
+            )
+            conn.execute("UPDATE candidate_reviews SET activated=1, activation_status='ACTIVATED' WHERE candidate_key=?", (candidate_key,))
+            conn.execute(
+                "INSERT INTO candidate_activation_audit (audit_id,candidate_key,approval_id,actor,activated_at,activation_key) VALUES (?,?,?,?,?,?)",
+                (activation_key, candidate_key, approval_id, current.reviewer, now, activation_key),
+            )
+        self.storage.write(operation)
         return updated
 
     def decide(self, candidate: AbstractionCandidate, *, reviewer: str, approved: bool, note: str = "") -> CandidateReview:
