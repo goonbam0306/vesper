@@ -16,17 +16,17 @@ Status is based on executable repository evidence, not prior Phase labels. `last
 | C-01 | IMPLEMENTED WITH EVIDENCE | `vesper/artifacts.py`, `migrations/037_safe_reset_receipts.sql`, `vesper/api.py`, `tests/test_safe_reset_closure.py` | `pytest -q tests/test_safe_reset_closure.py` → passed | Director/bootstrap-authorized scoped reset supports optional export, protected-scope rejection, secret-free canonical receipt, idempotent reset key, and artifact deletion while runtime/system state remains outside the boundary. |
 | C-02 | DECISION REQUIRED | documentation/security policy | Director policy decision | — | No Director selection of encryption policy A/B/C yet. |
 | C-03 | IMPLEMENTED WITH EVIDENCE | `vesper/approved_file_apply.py`, `tests/test_approved_file_apply.py`, `tests/test_patchset_rollback_closure.py` | `pytest -q tests/test_patchset_rollback_closure.py tests/test_approved_file_apply.py tests/test_canonical_e2e.py` → 7 passed | Multi-file PatchSet validates all stale contents before mutation and rolls back already-replaced files on injected replacement failure. |
-| D-01 | IN PROGRESS | `vesper/connections.py`, adapter modules | provider-neutral contract gate | — | Local boundary exists; production contract needs audit. |
-| D-02 | BLOCKED | adapter implementation | real authenticated read gate | — | Requires external credentials and designated service scope. |
-| D-03 | BLOCKED | adapter implementation | approval-gated sandbox write gate | — | Requires Director approval and designated reversible sandbox target. |
-| D-04 | IN PROGRESS | adapter/recovery modules | provider failure/ambiguous write gate | — | Local boundaries exist; real adapter recovery remains dependent on D-02/D-03. |
+| D-01 | IMPLEMENTED — LOCAL MCP EVIDENCE | `vesper/mcp_gateway.py`, `migrations/039_mcp_gateway.sql`, `tests/test_mcp_gateway_closure.py` | `python -m pytest -q tests/test_mcp_gateway_closure.py` → 4 passed | working tree | Vesper-controlled local/custom-only Gateway records server health, discovers generic tools, hashes schemas, re-registers schema changes for review, and keeps external contracts untrusted. |
+| D-02 | IMPLEMENTED — LOCAL MCP EVIDENCE | `vesper/mcp_gateway.py`, `tests/test_mcp_gateway_closure.py` | `python -m pytest -q tests/test_mcp_gateway_closure.py` → 4 passed | working tree | Approved credential-free local/custom sandbox read is persisted as provenance-bearing `EVIDENCE_ONLY` observation with `UNTRUSTED_EXTERNAL` instruction trust. |
+| D-03 | IMPLEMENTED — LOCAL MCP EVIDENCE | `vesper/mcp_gateway.py`, `migrations/039_mcp_gateway.sql`, `tests/test_mcp_gateway_closure.py` | `python -m pytest -q tests/test_mcp_gateway_closure.py` → 4 passed | working tree | Reversible local sandbox write begins `PENDING_APPROVAL`, deduplicates by server/idempotency key, and only produces a Vesper Kernel receipt after approval. Ambiguous writes are not replayed. |
+| D-04 | IMPLEMENTED — LOCAL MCP EVIDENCE | `vesper/mcp_gateway.py`, `tests/test_mcp_gateway_closure.py` | `python -m pytest -q tests/test_mcp_gateway_closure.py` → 4 passed | working tree | Deterministic sandbox proves schema drift review, transport timeout/offline health, malformed-result normalization, permission/error pathways, and ambiguity preservation without blind replay. No remote/provider integration was added. |
 | E-01 | IMPLEMENTED WITH EVIDENCE | `frontend/e2e/e01-repeated-director-workflow.spec.ts`, `frontend/e2e/support/vesper-harness.ts` | `cd frontend && VESPER_E2E_PYTHON=../.venv/bin/python npm run e2e -- --grep 'E-01'` → 1 passed; full local E2E → 22 passed; CI run `30522725076` → success | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | Browser-level Director workflow captures an idea, traverses all applicable V1 surfaces, persists settings, restarts backend/frontend against the same durable home, verifies continuity, and completes a second interaction cycle. |
-| E-02 | BLOCKED | frontend + adapter | external observation dashboard gate | — | Depends on D-track adapter availability. |
+| E-02 | IMPLEMENTED — LOCAL MCP UI EVIDENCE | `frontend/src/main.tsx`, `frontend/e2e/mcp-first.spec.ts` | `VESPER_E2E_PYTHON=/Users/goonbam/.hermes/hermes-agent/venv/bin/python npm --prefix frontend exec playwright test` → 23 passed | working tree | Generic Connections/External Capabilities surface exposes approved local/custom MCP servers, health, generic capabilities, schema generation, evidence/effect/recovery states, and credential-safe messaging; no provider-specific or native-app UI. |
 | E-03 | IMPLEMENTED WITH EVIDENCE | `frontend/e2e/e03-product-error-matrix.spec.ts` | `cd frontend && VESPER_E2E_PYTHON=../.venv/bin/python npm run e2e -- --grep 'E-03'` → 3 passed; full local E2E → 22 passed; CI run `30522725076` → success | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | Executable browser coverage verifies the full applicable product error-state matrix: no-model/no-data, approvals/process empty states, offline connections, stale memory, and disabled/retired Lane messaging without false success. |
 | F-01 | VERIFIED — REMOTE CI GREEN | `.github/workflows/vesper-ci.yml` | GitHub Actions run `30522725076` / job `90806552379` → success; all compile, migration/bootstrap, backend pytest, frontend build, Playwright, diff, and documentation steps passed | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | [Run](https://github.com/goonbam0306/vesper/actions/runs/30522725076) |
 | F-02 | VERIFIED — COMMIT/PUSH/CI EVIDENCE | `docs/VESPER_V1_CLOSURE_STATUS.md`, `docs/VESPER_V1_CLOSURE_SPEC.md` | `git push origin main` → `66d8b9937b510bcdb290e4ee8ea867dbec5559bf`; remote run `30522725076` → success | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | Exact closure status tree is pushed to `goonbam0306/vesper:main` and verified by CI. |
 | F-03 | IMPLEMENTED WITH EVIDENCE | `README.md`, `docs/VESPER_V1_CLOSURE_STATUS.md` | README contains authoritative spec/status links and explicit NOT SEALED conclusion | working tree | Historical phase claims are no longer presented as current seal evidence. |
-| Seal | NOT SEALED | repository-wide | final audit: local full gates passed; CI run `30522725076` success; unresolved applicable rows remain | `66d8b9937b510bcdb290e4ee8ea867dbec5559bf` | V1 cannot be sealed while C-02 is decision-required and D-01/D-04 remain in progress; E-02 remains externally blocked on D-track availability. |
+| Seal | NOT SEALED | repository-wide | final audit pending commit/push/remote CI; C-02 remains decision-required | working tree | D-01–D-04 and E-02 are locally implemented with evidence; V1 remains unsealed solely until the Director chooses C-02 encryption policy and this change receives remote CI evidence. |
 
 ## Evidence policy
 
@@ -35,18 +35,17 @@ Each row must cite exact commands, commit SHA, exit status, and (for CI) workflo
 ## Current explicit blockers
 
 - C-02 requires a Director selection of encryption policy A, B, or C.
-- D-02/D-03 require credentials, a designated service/sandbox, and the required approval; no live external state-changing action is performed implicitly.
-- E-02 depends on D-track availability.
+- F-01/F-02 must be refreshed only after this MCP-first change is committed, pushed, and a new GitHub Actions run succeeds.
 
 ## Current conclusion
 
-`VESPER V1 NOT SEALED` — E-01 and E-03 local closure gates are implemented with executable browser evidence, and the complete local/remote repository gates are green at commit `66d8b9937b510bcdb290e4ee8ea867dbec5559bf`. Seal is still withheld because the following applicable items remain unresolved:
+`VESPER V1 NOT SEALED` — D-01 through D-04 and E-02 have local executable evidence using only the Director-authorized credential-free local/custom MCP sandbox. The full local gate currently passes: backend `380 passed`, frontend build succeeds, and Playwright `23 passed`.
+
+Seal remains withheld only because:
 
 - C-02: Director must select local encryption policy A, B, or C.
-- D-01/D-04: local adapter boundary/recovery audit remains incomplete; D-02/D-03 remain blocked only on external credentials, designated scope, sandbox, and approval.
-- E-02: remains blocked on D-track external observation availability.
-- F-01/F-02 are verified: commit `66d8b9937b510bcdb290e4ee8ea867dbec5559bf`, CI run `30522725076` successful.
+- F-01/F-02: this MCP-first revision has not yet received its own pushed-commit and remote GitHub Actions evidence.
 
-These are not silently treated as complete or as approved deferrals.
+No provider-specific API integration or native-app UI was introduced.
 
-Last updated: 2026-07-30 (commit `66d8b9937b510bcdb290e4ee8ea867dbec5559bf`; CI run `30522725076`)
+Last updated: 2026-07-30 (MCP-first revision working tree; remote CI pending)

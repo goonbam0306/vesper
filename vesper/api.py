@@ -22,6 +22,7 @@ from .model_runtime import CognitiveRuntime, ModelRegistry, CognitiveRequest, Pr
 from .syscalls import SyscallEngine, SyscallRequest, SyscallError, ApprovalDecision, EffectStatus
 from .core_apps import CoreApps, CoreAppError
 from .connections import ConnectionStore, ConnectionError
+from .mcp_gateway import MCPGateway, LocalCustomMCPSandbox
 from .artifacts import ArtifactStore
 from .secret_store import SecretStore, SecretStoreError
 from .provider_adapter import ProviderAdapter, ProviderConnection
@@ -66,6 +67,7 @@ class Runtime:
         self.syscalls = SyscallEngine(self.storage, self.kernel)
         self.core_apps = CoreApps(self.storage)
         self.connections = ConnectionStore(self.storage, artifact_store=ArtifactStore(self.home, self.storage))
+        self.mcp_gateway = MCPGateway(self.storage, self.connections)
         self.candidate_reviews = CandidateReviewStore(self.storage)
         self.bootstrap_token = secrets.token_urlsafe(32)
 
@@ -798,6 +800,50 @@ fetch('/api/bootstrap').then(r=>r.json()).then(d=>{bootstrapToken=d.session; win
         body = await request.json()
         try:
             return {"capability": instance.connections.register_capability(server_id=str(body["server_id"]), name=str(body["name"]), description=str(body.get("description", "")), schema=dict(body.get("schema", {})), risk_class=str(body.get("risk_class", "UNTRUSTED")))}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.post("/api/mcp/local-sandbox")
+    async def register_local_mcp_sandbox(request: Request):
+        body = await request.json()
+        try:
+            server_id = str(body.get("server_id", "local-custom-sandbox"))
+            return {"server": instance.mcp_gateway.register_local_server(server_id=server_id, display_name=str(body.get("display_name", "Local Custom MCP Sandbox")), transport=LocalCustomMCPSandbox())}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.post("/api/mcp/{server_id}/discover")
+    def discover_mcp(server_id: str):
+        try:
+            return {"capabilities": instance.mcp_gateway.discover(server_id)}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.get("/api/mcp/overview")
+    def mcp_overview():
+        return instance.mcp_gateway.overview()
+
+    @app.post("/api/mcp/{server_id}/read")
+    async def mcp_read(server_id: str, request: Request):
+        body = await request.json()
+        try:
+            return {"observation": instance.mcp_gateway.read(server_id=server_id, capability_id=str(body["capability_id"]), arguments=dict(body.get("arguments", {})))}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.post("/api/mcp/{server_id}/effects")
+    async def propose_mcp_effect(server_id: str, request: Request):
+        body = await request.json()
+        try:
+            return {"effect": instance.mcp_gateway.propose_write(server_id=server_id, capability_id=str(body["capability_id"]), process_id=str(body["process_id"]), idempotency_key=str(body["idempotency_key"]))}
+        except ConnectionError as exc:
+            raise connection_error(exc) from exc
+
+    @app.post("/api/mcp/effects/{effect_id}/approval")
+    async def approve_mcp_effect(effect_id: str, request: Request):
+        body = await request.json()
+        try:
+            return {"effect": instance.mcp_gateway.approve_and_execute(effect_id=effect_id, approved=bool(body.get("approved", False)), arguments=dict(body.get("arguments", {})))}
         except ConnectionError as exc:
             raise connection_error(exc) from exc
 

@@ -473,90 +473,59 @@ Inject a failure during a multi-file PatchSet and prove the documented behavior.
 
 ---
 
-# 6. Closure Track D — External Adapter Vertical Slice
+# 6. Closure Track D — MCP-Native External Capability Layer
 
-Do not mark LocalAdapterBoundary tests as a completed real external integration.
+> **Director-authorized MCP-first amendment (2026-07-30):** this Track and E-02 supersede conflicting earlier adapter language. MCP is Vesper's canonical external-capability transport. Provider-specific Core API adapters are not the default extension model; provider-specific/native app UI is Post-V1 unless separately selected by the Director.
 
-## D-01 Real Adapter Interface
+## Non-negotiable architecture
 
-Define the provider-neutral production adapter contract for:
+- MCP is a transport/capability boundary, never execution authority.
+- Custom and third-party capabilities enter only through a Vesper-controlled MCP Gateway.
+- LLMs, Lanes, Skills, Processes, and UI never directly invoke unrestricted MCP tools.
+- The Gateway discovers, normalizes, classifies, filters, reviews, and exposes capabilities through Vesper policy; Kernel remains authority for permissions, approvals, scheduling, effects, receipts, and reconciliation.
+- MCP-returned content/data remains untrusted external observation and never becomes trusted instruction.
+- Raw credentials and secret values never enter canonical Vesper state. MCP metadata may be overridden by Vesper policy or Director review.
 
-- authenticated read
-- provenance
-- normalized external data
-- effect proposal
-- approval-gated write
-- provider response
-- canonical effect receipt
-- offline/error behavior
-- rate/permission failure behavior
-- external instruction/data separation
+## D-01 Vesper-Controlled MCP Gateway
 
----
-
-## D-02 First Real Read Adapter
-
-Implement at least one real connected-service read adapter.
-
-Preferred V1 choices should reuse the project's intended personal-OS integrations, such as Google Calendar, Gmail, Google Drive, or GitHub.
-
-Use credential references, never raw credential persistence in Vesper state.
+Implement server registration/lifecycle and health; local/custom configuration; discovery; normalized identity; input/output schema capture and version-change detection; read/write/external-effect, reversibility, idempotency, approval, and Kernel-permission classification; Process/Lane-scoped filtering; provenance; external content isolation; and canonical error normalization.
 
 ### Gate
 
-```text
-external service
-→ adapter read
-→ provenance-bearing normalized artifact/state
-→ Kernel/Vesper storage
-→ UI or Process consumption
-```
-
-No external text may become trusted instruction merely because it came from the provider.
+A connected MCP server's capabilities are discovered, classified, reviewable, and exposed exclusively through Vesper-owned permission and approval policy.
 
 ---
 
-## D-03 First Real Approval-Gated Write Adapter
+## D-02 Real MCP Read Vertical
 
-Implement at least one realistic external write/effect path.
-
-Examples:
-
-- create/update a sandbox Calendar event,
-- create a safe test GitHub artifact/issue in a designated sandbox,
-- another reversible test integration approved by Director.
-
-### Required path
+Use one real custom/local or separately Director-approved MCP server:
 
 ```text
-Process
-→ proposed external effect
-→ Kernel permission check
-→ Director approval when required
-→ adapter write
-→ canonical receipt
-→ reconciliation/read-back
+MCP server → Vesper MCP Gateway → capability selection → Kernel/Process permission check
+→ MCP read → provenance-bearing normalized external observation → Vesper storage → generic UI or Process consumption
 ```
 
-### Stop condition
-
-Do not perform live state-changing external actions without the required Director approval and designated test/sandbox target.
+The result remains untrusted external observation and does not silently become authoritative canonical state.
 
 ---
 
-## D-04 Adapter Recovery
+## D-03 Approval-Gated MCP Write Vertical
 
-Implement/reconcile:
+Use only a custom/local reversible sandbox or separately Director-approved sandbox:
 
-- provider timeout
-- provider unavailable
-- expired credential
-- permission denied
-- rate limit
-- ambiguous write result
-- duplicate retry
+```text
+Process → proposed external effect → Kernel permission validation → approval evaluation → Director approval
+→ MCP Gateway invocation → normalized result → canonical effect receipt → reconciliation/read-back
+→ confirmed, failed, retryable, or ambiguous final state
+```
 
-Ambiguous write results must not be blindly replayed.
+Models may propose but cannot execute a mutation. Missing Process authority or matching approval must fail safely. No production/personal-account mutation is authorized.
+
+---
+
+## D-04 MCP Recovery and Reconciliation
+
+Test unavailable/startup failure, timeout, missing tool, schema change, malformed result, inaccessible credential reference, permission denial, rate-limit/retry-after, ambiguous write, duplicate retry, restart during pending/executing effect, stale state, reconnect, and reconciliation after uncertain completion. Ambiguous writes are never blindly replayed: occurrence is determined before retry.
 
 ---
 
@@ -588,17 +557,21 @@ Do not equate "browser reopen" alone with a repeated daily workflow if the actua
 
 ---
 
-## E-02 External Data in Dashboard
+## E-02 Generic MCP External Capability UI
 
-When D-track adapter work is available, show normalized connected-service information in the Vesper shell without making the external system authoritative over Vesper state.
+Provide generic, non-provider-specific surfaces for MCP-backed capabilities. Display registered MCP connections; connection health and stale/offline state; discovered capabilities; read/write/effect classification; approval requirements; allowed Process/Lane scope; external observations and provenance; pending, approved-pending, confirmed, failed, and ambiguous effects; canonical receipts; and schema changes requiring review.
 
-Must clearly distinguish:
+The UI must visibly distinguish:
 
 - Vesper canonical state
-- external observations
-- pending external effects
-- confirmed external effects
-- stale/offline connection state
+- untrusted external observations
+- proposed external effects
+- approved pending effects
+- confirmed effects
+- stale/offline data
+- ambiguous effects requiring reconciliation
+
+Do not add Calendar, Gmail, GitHub, Drive, or another native provider-specific UI to satisfy this gate.
 
 ---
 
