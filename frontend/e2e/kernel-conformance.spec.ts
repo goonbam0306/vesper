@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 
 const frontendDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const repoDir = path.resolve(frontendDir, '..')
-const pythonCommand = path.join(repoDir, '.venv', 'bin', 'python')
+const pythonCommand = process.env.VESPER_E2E_PYTHON ?? process.env.PYTHON ?? 'python3'
 
 type Child = { process: ChildProcess; output: () => string }
 type WireRequest = { path: string; model?: string; authorization?: string; body: any }

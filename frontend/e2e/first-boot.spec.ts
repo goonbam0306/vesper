@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 const frontendDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const repoDir = path.resolve(frontendDir, '..')
-const pythonCommand = path.join(repoDir, '.venv', 'bin', 'python')
+const pythonCommand = process.env.VESPER_E2E_PYTHON ?? process.env.PYTHON ?? 'python3'
 
 type Child = { process: ChildProcess; output: () => string }
 type Harness = { home: string; secretRoot: string; fake: Server; fakePort: number; backendPort: number; frontendPort: number; requests: Array<{ path: string; model?: string; authorization?: string }>; backend: Child; frontend: Child; frontendUrl: string; restart: () => Promise<void>; close: () => Promise<void> }

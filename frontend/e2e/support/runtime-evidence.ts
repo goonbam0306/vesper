@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import path from 'node:path'
 
 const repoDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..')
-const python = path.join(repoDir, '.venv', 'bin', 'python')
+const python = process.env.VESPER_E2E_PYTHON ?? process.env.PYTHON ?? 'python3'
 
 /** Read only the isolated runtime SQLite database. No production endpoint is used. */
 export async function readRuntimeEvidence(dbPath: string): Promise<Record<string, any[]>> {
