@@ -1,0 +1,22 @@
+.vesper-presence-icon { --presence-stroke: 2.25; color: var(--ink, #e8e2d7); display: inline-block; flex: 0 0 auto; overflow: visible; vertical-align: middle; }
+.vesper-presence-icon path[data-segment], .vesper-presence-icon .presence-trace, .vesper-presence-icon .presence-seal { stroke: currentColor; stroke-width: var(--presence-stroke); stroke-linecap: round; stroke-linejoin: round; }
+.vesper-presence-icon .presence-trace, .vesper-presence-icon .presence-core, .vesper-presence-icon .presence-input-packets, .vesper-presence-icon .presence-output-packets, .vesper-presence-icon .presence-jam, .vesper-presence-icon .presence-seal { opacity: 0; }
+.vesper-presence-icon .presence-core, .vesper-presence-icon .presence-input-packets, .vesper-presence-icon .presence-output-packets, .vesper-presence-icon .presence-jam { fill: currentColor; }
+.vesper-presence-icon.size-16 { --presence-stroke: 2.05; }
+.vesper-presence-icon.size-32 { --presence-stroke: 2.45; }
+.vesper-presence-icon.size-48 { --presence-stroke: 2.7; }
+.vesper-presence-icon.is-thinking path[data-segment="A"], .vesper-presence-icon.is-thinking path[data-segment="D"] { animation: aperture-pair-a 2.4s ease-in-out infinite; }
+.vesper-presence-icon.is-thinking path[data-segment="B"], .vesper-presence-icon.is-thinking path[data-segment="C"] { animation: aperture-pair-b 2.4s ease-in-out infinite; }
+.vesper-presence-icon.is-retrieving .presence-input-packets, .vesper-presence-icon.is-retrieving .presence-core, .vesper-presence-icon.is-retrieving .presence-trace { animation: aperture-intake 2.2s ease-in-out infinite; }
+.vesper-presence-icon.is-writing .presence-output-packets, .vesper-presence-icon.is-writing .presence-core, .vesper-presence-icon.is-writing .presence-trace { animation: aperture-output 2.2s ease-in-out infinite; }
+.vesper-presence-icon.is-waiting path[data-segment="A"], .vesper-presence-icon.is-waiting path[data-segment="D"] { transform: translate(-1px, 1px); }
+.vesper-presence-icon.is-waiting path[data-segment="B"], .vesper-presence-icon.is-waiting path[data-segment="C"] { transform: translate(1px, -1px); }
+.vesper-presence-icon.is-blocked { color: #dc796c; }
+.vesper-presence-icon.is-blocked .presence-jam, .vesper-presence-icon.is-blocked .presence-seal { opacity: 1; }
+.vesper-presence-icon.is-blocked path[data-segment="A"], .vesper-presence-icon.is-blocked path[data-segment="D"] { transform: translate(-2px, 2px); }
+.vesper-presence-icon.is-blocked path[data-segment="B"], .vesper-presence-icon.is-blocked path[data-segment="C"] { transform: translate(2px, -2px); }
+@keyframes aperture-pair-a { 0%, 100% { transform: translate(0); } 30%, 55% { transform: translate(2px, 2px); } }
+@keyframes aperture-pair-b { 0%, 20%, 100% { transform: translate(0); } 50%, 75% { transform: translate(-2px, -2px); } }
+@keyframes aperture-intake { 0%, 100% { opacity: 0; transform: translateX(-6px); } 30%, 65% { opacity: 1; transform: translateX(0); } }
+@keyframes aperture-output { 0%, 30% { opacity: 0; transform: translateX(0); } 55%, 85% { opacity: 1; transform: translateX(6px); } 100% { opacity: 0; transform: translateX(9px); } }
+@media (prefers-reduced-motion: reduce) { .vesper-presence-icon *, .vesper-presence-icon.is-thinking path[data-segment] { animation: none !important; } .vesper-presence-icon.is-retrieving .presence-input-packets, .vesper-presence-icon.is-retrieving .presence-core, .vesper-presence-icon.is-writing .presence-output-packets, .vesper-presence-icon.is-writing .presence-core { opacity: 1; } }
